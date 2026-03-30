@@ -85,12 +85,11 @@ class SeraphVLMTest:
             user_2 = f"Target: {target_obj}, BBox: {bbox}, Distance: 1.2m. What is the next action?"
             res_2 = self.ask_vlm(pil_img, sys_2, user_2)
             
-            print(f"🏁 [최종 VLA 결과]: {res_2}")
+            print(f"🏁 [최종 VLM 결과]: {res_2}")
 
         except Exception as e:
             print(f"❌ 테스트 중 에러 발생: {e}")
 
 if __name__ == "__main__":
     tester = SeraphVLMTest()
-    # 파일명이 test.jpg가 맞는지 확인하세요!
     tester.run_test("test.jpg", "나 목말라.")
