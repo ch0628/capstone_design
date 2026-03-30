@@ -39,7 +39,7 @@ Return Only JSON, the format should always be the same as below:
         "role": "user",
         "content":[ 
             {"type": "image", "image":rgb_image},
-            {"type":"text", "text": "목 말라!"}
+            {"type":"text", "text": "잘 안보여!"}
         ]
     }
 ]
