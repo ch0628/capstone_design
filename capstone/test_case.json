@@ -1,0 +1,173 @@
+{
+  "01_L": {
+    "title": "간접 욕구 - 목마름",
+    "image_path": "data/test_01_L.jpg",
+    "command": "아 너무 목말라..",
+    "expected": {
+      "target": "cup",
+      "move": "left"
+    }
+  },
+  "01_R": {
+    "title": "간접 욕구 - 목마름",
+    "image_path": "data/test_01_R.jpg",
+    "command": "아 너무 목말라..",
+    "expected": {
+      "target": "cup",
+      "move": "right"
+    }
+  },
+  "02": {
+    "title": "상황 제시 - 휴식",
+    "image_path": "data/test_02.jpg",
+    "command": "다리가 아프니 좀 쉬어야겠어.",
+    "expected": {
+      "target": "chair",
+      "move": "left"
+    }
+  },
+  "03": {
+    "title": "간접 욕구 - 피로",
+    "image_path": "data/test_03.jpg",
+    "command": "잠깐 눕고 싶네.",
+    "expected": {
+      "target": "bed",
+      "move": "left"
+    }
+  },
+  "04": {
+    "title": "상황 제시 - 수면",
+    "image_path": "data/test_04.jpg",
+    "command": "이제 자려고.",
+    "expected": {
+      "target": "bed",
+      "move": "right"
+    }
+  },
+  "05": {
+    "title": "상황 제시 - 업무/공부",
+    "image_path": "data/test_05.jpg",
+    "command": "이제 앉아서 일을 시작해볼까.",
+    "expected": {
+      "target": "chair",
+      "move": "left"
+    }
+  },
+  "06": {
+    "title": "상황 제시 - 식사 준비",
+    "image_path": "data/test_06.jpg",
+    "command": "밥 먹을 준비 하자.",
+    "expected": {
+      "target": "dining table",
+      "move": "right"
+    }
+  },
+  "07": {
+    "title": "간접 욕구 - 졸음",
+    "image_path": "data/test_07.jpg",
+    "command": "너무 졸리다.",
+    "expected": {
+      "target": "bed",
+      "move": "front"
+    }
+  },
+  "08": {
+    "title": "간접 욕구 - 휴식 (거실)",
+    "image_path": "data/test_08.jpg",
+    "command": "소파에 기대서 TV나 봐야지.",
+    "expected": {
+      "target": "couch",
+      "move": "front"
+    }
+  },
+  "09": {
+    "title": "상황 제시 - 육아",
+    "image_path": "data/test_09.jpg",
+    "command": "아기 낮잠 재울 시간이야.",
+    "expected": {
+      "target": "bed",
+      "move": "right"
+    }
+  },
+  "10": {
+    "title": "간접 욕구 - 생리현상",
+    "image_path": "data/test_10.jpg",
+    "command": "화장실이 너무 급해!",
+    "expected": {
+      "target": "toilet",
+      "move": "right"
+    }
+  },
+  "11": {
+    "title": "상황 추론 - 피로/휴식 (세탁실)",
+    "image_path": "data/test_11.jpg",
+    "command": "계속 서있었더니 다리가 너무 아프네. 잠깐만 앉아야겠다.",
+    "expected": {
+      "target": "chair",
+      "move": "left"
+    }
+  },
+  "12": {
+    "title": "상황 추론 - 작업/공부 준비",
+    "image_path": "data/test_12.jpg",
+    "command": "내일 제출할 과제를 마무리해야겠어.",
+    "expected": {
+      "target": "chair",
+      "move": "right"
+    }
+  },
+  "13": {
+    "title": "간접 욕구 - 수면 (침실)",
+    "image_path": "data/test_13.jpg",
+    "command": "오늘 하루도 참 길었다. 쓰러질 것 같아.",
+    "expected": {
+      "target": "bed",
+      "move": "right"
+    }
+  },
+  "14": {
+    "title": "간접 욕구 - 여가 시간",
+    "image_path": "data/test_14.jpg",
+    "command": "푹신한 곳에서 넷플릭스나 보면서 뒹굴거리고 싶다.",
+    "expected": {
+      "target": "couch",
+      "move": "left"
+    }
+  },
+  "15": {
+    "title": "상황 추론 - 업무 처리",
+    "image_path": "data/test_15.jpg",
+    "command": "밀린 이메일 답장 좀 보내야겠군.",
+    "expected": {
+      "target": "chair",
+      "move": "left"
+    }
+  },
+  "16": {
+    "title": "상황 추론 - 체온 조절",
+    "image_path": "data/test_16.jpg",
+    "command": "방이 좀 쌀쌀하네. 두꺼운 이불 덮고 몸 좀 녹여야지.",
+    "expected": {
+      "target": "bed",
+      "move": "right"
+    }
+  },
+  "17": {
+    "title": "상황 제시 - 육아 (수면)",
+    "image_path": "data/test_17.jpg",
+    "command": "이제 꿈나라로 갈 시간이에요.",
+    "expected": {
+      "target": "bed",
+      "move": "left"
+    }
+  },
+  "18": {
+    "title": "간접 욕구 - 목마름",
+    "image_path": "data/test_18.jpg",
+    "command": "목이 타네",
+    "expected": {
+      "target": "cup",
+      "move": "front"
+    }
+  }
+}

@@ -4,6 +4,7 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForImageTextToText
 from ultralytics import YOLO
+import os
 
 
 class SeraphVLMTest:
@@ -144,6 +145,11 @@ Use only COCO classes for target_object.
             if bbox is None:
                 print(f"❌ [YOLO] 이미지 내에서 '{target_obj}'를 물리적으로 특정할 수 없습니다.")
                 return {"move": "stop", "status": f"Target '{target_obj}' not found"}
+            
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            save_path = os.path.join("test_result", f"{base_name}_result.jpg")
+            yolo_results[0].save(filename=save_path)
+            print(f"[ '{save_path}' 파일로 저장 완료 ]")
 
             img_w, img_h = pil_img.size
             x1, y1, x2, y2 = bbox
@@ -221,7 +227,20 @@ Do not override them.
 
 
 if __name__ == "__main__":
-    tester = SeraphVLMTest()
-    result = tester.run_test("test.jpg", "나 목말라.", distance=1.7)
+    file_path = "test_cases.json"
+    with open(file_path, "r", encoding="utf-8") as f:
+        all_cases = json.load(f)
+    
+    case_id = "01"
+    case = all_cases[case_id]
 
-    print(f"📌 [최종 반환값]: {result}")
+    tester = SeraphVLMTest()
+    result = tester.run_test(case["image_path"], case["command"], distance=1.7)
+
+    all_cases[case_id]["actual"] = result
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(all_cases, f, indent=2, ensure_ascii=False)
+
+    print(f"📌 [최종 반환값 (result)]: {result}")
+    print(f"🎯 [예상 결과값 (Expected)]: {case['expected']}")
