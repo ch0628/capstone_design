@@ -97,159 +97,135 @@ class SeraphVLMTest:
             pil_img = Image.open(image_path).convert("RGB")
             print(f"\n📸 이미지 '{image_path}' 분석 시작 (명령: {command}, distance={distance:.2f}m)")
 
-            # STEP 1: 명령에서 target object 추출
+            # STEP 1: 명령에서 우선순위 후보군(target_candidates) 추출
             sys_1 = """
 Return only one JSON object.
 No explanation.
 
-The chosen target_object MUST be clearly visible in the provided image.
-Do not guess or assume objects that are outside the camera view.
+The "target_candidates" must be a list of COCO classes in order of priority based on the command.
+Example: "I want to sit and watch TV" -> ["chair", "couch", "tv"]
 
 Format:
-{"intent":"drink","target_object":"cup"}
-
-Use only COCO classes for target_object.
+{"intent":"...","target_candidates":["obj1", "obj2"]}
 """
             res_1 = self.ask_vlm(pil_img, sys_1, command, max_new_tokens=192)
             print(f"📦 [VLM 1차 응답]: {res_1}")
 
-            target_obj = None
+            target_candidates = []
             json_matches = re.findall(r"\{.*?\}", res_1, re.DOTALL)
             if json_matches:
                 try:
                     data = json.loads(json_matches[-1])
-                    target_obj = data.get("target_object")
+                    target_candidates = data.get("target_candidates", [])
                 except json.JSONDecodeError:
                     print("⚠️ JSON 파싱 실패")
 
-            if not target_obj:
-                print("❌ AI가 명령에서 타겟 물체를 식별하지 못했습니다.")
-                return {"status": "fail", "reason": "No target object found"}
+            if not target_candidates:
+                print("❌ AI가 명령에서 타겟 후보를 식별하지 못했습니다.")
+                return {"status": "fail", "reason": "No target candidates found"}
 
-            # STEP 2: YOLO로 target object 탐지
-            print(f"🔍 [YOLO] '{target_obj}' 찾는 중...")
+            # STEP 2: YOLO로 후보군 중 탐지되는 첫 번째 물체 탐지
             yolo_results = self.yolo.predict(pil_img, conf=0.25, verbose=False)
-
+            target_obj = None
             best_box = None
-            best_conf = -1.0
 
-            for r in yolo_results:
-                for box in r.boxes:
-                    label = r.names[int(box.cls[0])].lower()
-                    conf = float(box.conf[0])
-                    if label == target_obj.lower() and conf > best_conf:
-                        best_conf = conf
-                        best_box = box
+            for cand in target_candidates:
+                print(f"🔍 [YOLO] '{cand}' 검사 중...")
+                for r in yolo_results:
+                    for box in r.boxes:
+                        label = r.names[int(box.cls[0])].lower()
+                        if label == cand.lower():
+                            best_box = box
+                            target_obj = cand
+                            break
+                    if best_box: break
+                if best_box: break
 
-            bbox = best_box.xyxy[0].tolist() if best_box is not None else None
-            print(f"🎯 [YOLO 결과]: {bbox}")
+            if best_box is None:
+                print(f"❌ [YOLO] 후보군 {target_candidates} 중 사진에서 탐지된 물체가 없습니다.")
+                return {"move": "stop", "status": f"No candidates found in image"}
 
-            if bbox is None:
-                print(f"❌ [YOLO] 이미지 내에서 '{target_obj}'를 물리적으로 특정할 수 없습니다.")
-                return {"move": "stop", "status": f"Target '{target_obj}' not found"}
+            bbox = best_box.xyxy[0].tolist()
+            print(f"🎯 [최종 타겟 확정]: {target_obj} at {bbox}")
             
+            # 결과 이미지 저장 로직
             base_name = os.path.splitext(os.path.basename(image_path))[0]
             save_path = os.path.join("test result", f"{base_name}_result.jpg")
-            if best_box is not None:
-                target_cls_id = int(best_box.cls[0])
-                yolo_results[0].boxes = yolo_results[0].boxes[yolo_results[0].boxes.cls == target_cls_id]
-                
-                yolo_results[0].save(filename=save_path)
-                print(f"[ '{save_path}'에 저장 완료 ]")
-            else:
-                yolo_results[0].save(filename=save_path)
+            target_cls_id = int(best_box.cls[0])
+            # 해당 클래스 박스만 남겨서 저장
+            yolo_results[0].boxes = yolo_results[0].boxes[yolo_results[0].boxes.cls == target_cls_id]
+            yolo_results[0].save(filename=save_path)
+            print(f"[ '{save_path}'에 저장 완료 ]")
 
+            # 좌표 계산
             img_w, img_h = pil_img.size
             x1, y1, x2, y2 = bbox
             cx = (x1 + x2) / 2
-            cy = (y1 + y2) / 2
-
             cx_norm = cx / img_w
-            cy_norm = cy / img_h
+            cy_norm = (y1 + y2) / 2 / img_h
             w_norm = (x2 - x1) / img_w
             h_norm = (y2 - y1) / img_h
 
-            print(
-                f"cx_norm={cx_norm:.3f}, cy_norm={cy_norm:.3f}, "
-                f"w_norm={w_norm:.3f}, h_norm={h_norm:.3f}, distance={distance:.2f}"
-            )
+            print(f"cx_norm={cx_norm:.3f}, distance={distance:.2f}")
 
-            # STEP 3: 이미지 없이 숫자 정보만으로 move 판단
+            # STEP 3: 숫자 정보만으로 move 판단
             sys_2 = """
 Return only one JSON object.
 No explanation.
-
-Format:
-{"move":"front","status":"..."}
-
-Allowed values for "move":
-- "front"
-- "back"
-- "left"
-- "right"
-- "stop"
-
-You must decide using ONLY the numeric values provided by the user.
-Do NOT use visual impression, object pose, handle direction, or background context.
+Format: {"move":"front","status":"..."}
+Allowed: "front", "back", "left", "right", "stop"
 
 Strict rules:
-1. Use cx_norm as the primary rule for horizontal movement.
-2. If cx_norm < 0.45, return "left".
-3. If cx_norm > 0.55, return "right".
-4. If 0.45 <= cx_norm <= 0.55, treat the target as horizontally centered.
-5. When the target is horizontally centered, use ONLY distance:
-   - if distance < 0.8, return "back"
-   - if 0.8 <= distance <= 1.2, return "stop"
-   - if distance > 1.2, return "front"
-
-These rules are mandatory.
-Do not override them.
+1. If cx_norm < 0.45, return "left".
+2. If cx_norm > 0.55, return "right".
+3. If 0.45 <= cx_norm <= 0.55 (centered):
+   - distance < 0.8: "back"
+   - 0.8 <= distance <= 1.2: "stop"
+   - distance > 1.2: "front"
 """
-
             user_2 = (
-                f"Target={target_obj}. "
-                f"cx_norm={cx_norm:.3f}, cy_norm={cy_norm:.3f}, "
-                f"w_norm={w_norm:.3f}, h_norm={h_norm:.3f}, "
-                f"distance={distance:.2f}. "
-                f"Apply the strict rules exactly."
+                f"Target={target_obj}. cx_norm={cx_norm:.3f}, "
+                f"w_norm={w_norm:.3f}, h_norm={h_norm:.3f}, distance={distance:.2f}."
             )
 
             res_2 = self.ask_llm(sys_2, user_2, max_new_tokens=128)
             print(f"🏁 [최종 VLM 결과]: {res_2}")
 
-            action = None
             json_matches = re.findall(r"\{.*?\}", res_2, re.DOTALL)
             if json_matches:
                 try:
                     action = json.loads(json_matches[-1])
-                    print(f"✅ [파싱된 최종 액션]: {action}")
                     action['target'] = target_obj
                     return action
                 except json.JSONDecodeError:
-                    print("⚠️ 최종 액션 JSON 파싱 실패")
+                    pass
 
-            return {"status": "fail", "reason": "No valid action JSON found"}
+            return {"status": "fail", "reason": "Final action parsing failed"}
 
         except Exception as e:
-            print(f"❌ 테스트 중 에러 발생: {e}")
+            print(f"❌ 에러 발생: {e}")
             return {"status": "error", "reason": str(e)}
-
 
 if __name__ == "__main__":
     file_path = "test_cases.json"
-    with open(file_path, "r", encoding="utf-8") as f:
-        all_cases = json.load(f)
-    
-    case_id = "02"
-    case = all_cases[case_id]
+    if not os.path.exists(file_path):
+        print(f"❌ {file_path} 파일이 없습니다.")
+    else:
+        with open(file_path, "r", encoding="utf-8") as f:
+            all_cases = json.load(f)
 
-    tester = SeraphVLMTest()
-    result = tester.run_test(case["image_path"], case["command"], distance=1.7)
+        tester = SeraphVLMTest()
 
-    all_cases[case_id]["actual"] = result
-
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(all_cases, f, indent=2, ensure_ascii=False)
-
-    print(f"📌 [최종 반환값 (result)]: {result}")
-    print(f"🎯 [예상 결과값 (Expected)]: {case['expected']}")
+        for case_id, case_data in all_cases.items():
+            print(f"\n" + "="*50)
+            print(f"🔎 테스트 ID: {case_id}")
+            
+            dist = case_data.get("distance", 1.7)
+            result = tester.run_test(case_data["image_path"], case_data["command"], distance=dist)
+            
+            all_cases[case_id]["actual"] = result
+            
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(all_cases, f, indent=2, ensure_ascii=False)
+                
+            print(f"✅ 케이스 {case_id} 완료 및 저장됨")

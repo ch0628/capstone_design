@@ -4,6 +4,5 @@ documents/
 .vscode/
 __pycache__/
 *.pt
-*.env
-capstone/.DS_Store
-.DS_Store
+.env
+*.DS_Store
