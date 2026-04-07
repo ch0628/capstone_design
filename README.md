@@ -24,3 +24,11 @@ conda activate vla_v2
 pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
 pip install "transformers[serving] @ git+https://github.com/huggingface/transformers.git@main"
 ```
+## Hugging Face Token Setup
+
+이 프로젝트는 Hugging Face 모델 다운로드를 위해 사용자 토큰이 필요할 수 있습니다.
+
+Hugging Face에서 Access Token을 발급합니다.
+프로젝트 루트 디렉토리에 .env 파일을 생성합니다.
+아래와 같이 토큰을 입력합니다.
+HF_TOKEN=your_huggingface_token_here

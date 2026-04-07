@@ -4,5 +4,6 @@ documents/
 .vscode/
 __pycache__/
 *.pt
+<<<<<<< HEAD
 .env
 *.DS_Store

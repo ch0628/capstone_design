@@ -5,15 +5,23 @@ from PIL import Image
 from transformers import AutoProcessor, AutoModelForImageTextToText
 from ultralytics import YOLO
 import os
+from dotenv import load_dotenv
 
 class SeraphVLMTest:
     def __init__(self):
+        load_dotenv()
+        hf_token = os.getenv("HF_TOKEN")
+
+        if not hf_token:
+            raise ValueError("HF_TOKEN이 .env 파일에 없습니다.")
+        
         print("🚀 [1/2] VLM(Qwen3.5-4B) 로딩 중...")
         vlm_id = "Qwen/Qwen3.5-4B"
 
-        self.processor = AutoProcessor.from_pretrained(vlm_id)
+        self.processor = AutoProcessor.from_pretrained(vlm_id, token=hf_token)
         self.vlm = AutoModelForImageTextToText.from_pretrained(
             vlm_id,
+            token=hf_token,
             dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             device_map="auto",
         )
