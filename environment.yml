@@ -87,3 +87,4 @@ dependencies:
       - ultralytics==8.4.31
       - ultralytics-thop==2.0.18
       - urllib3==2.6.3
+      - python-dotenv==1.2.2
