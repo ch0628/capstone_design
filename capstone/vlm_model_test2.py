@@ -204,6 +204,40 @@ Strict rules:
                 try:
                     action = json.loads(json_matches[-1])
                     action['target'] = target_obj
+                    sys_3 = """
+Return only one JSON object.
+No explanation.
+
+Context: The robot has ALREADY found the target object and moved right in front of it.
+CRITICAL RULE 1: DO NOT output any tasks related to moving, navigating, or searching (e.g., "이동", "이동하기", "찾기", "다가가기").
+CRITICAL RULE 2: The task MUST be highly concise, using only 1~3 words representing the core action (e.g., "옮기기", "가져오기", "열기"). Do not use long sentences.
+CRITICAL RULE 3: If there is no logical physical interaction to perform with the target, or if the main goal is simply to show the user where the object is, the task MUST be "주위 돌며 알리기".
+
+Examples:
+- Command: "목말라", Target: "cup" -> {"task": "가져오기"}
+- Command: "약 먹을 시간이야", Target: "bottle" -> {"task": "전달하기"}
+- Command: "이제 잘래", Target: "bed" -> {"task": "조명 제어"}
+- Command: "밥 먹을 준비 하자", Target: "chair" -> {"task": "주위 돌며 알리기"}
+- Command: "여기 청소해야지", Target: "trash can" -> {"task": "열기"}
+- Command: "내 가방 어딨지?", Target: "backpack" -> {"task": "주위 돌며 알리기"}
+
+Format:
+{"task": "..."}
+"""
+                    user_3 = f"Original Command: {command}\nConfirmed Target Object: {target_obj}"
+                    res_3 = self.ask_llm(sys_3, user_3, max_new_tokens=64)
+                    print(f"🛠️  [최종 VLM 결과(Task)]: {res_3}")
+                    
+                    task_matches = re.findall(r"\{.*?\}", res_3, re.DOTALL)
+                    if task_matches:
+                        try:
+                            task_data = json.loads(task_matches[-1])
+                            action['task'] = task_data.get("task", "대기")
+                        except json.JSONDecodeError:
+                            action['task'] = "..."
+                    else:
+                        action['task'] = "..."
+
                     return action
                 except json.JSONDecodeError:
                     pass
