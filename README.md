@@ -53,7 +53,7 @@
 2. **센서 데이터 수집** — Raspberry Pi가 RGB 이미지와 Depth Map 획득
 3. **데이터 전송** — ROS2-TCP Bridge로 Seraph 서버에 전달
 4. **객체 인식** — YOLOv8이 가정환경 물체 탐지 (bounding box, class)
-5. **상위 추론** — Qwen3-VL이 명령·시각·공간 정보를 종합해 행동 결정
+5. **상위 추론** — Qwen3.5가 명령·시각·공간 정보를 종합해 행동 결정
 6. **Action Chunk 생성** — `{Action, Distance, ...}` JSON 형식으로 구조화
 7. **저수준 제어** — Arduino가 모터 제어를 통해 물리적 이동 수행
 
@@ -101,7 +101,7 @@
 
 ```bash
 git clone https://github.com/ch0628/capstone_design.git
-cd capstone
+cd capstone_design
 ```
 
 ### 2. GPU Server Setup
@@ -110,34 +110,33 @@ cd capstone
 
 먼저 conda 환경을 생성하고 활성화합니다.
 
-​```bash
+```bash
 conda env create -f environment.yml
 conda activate vla_v2
-​```
+```
 
 이후 필요한 패키지를 별도로 설치합니다.
 
-​```bash
-pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 \
-    --index-url https://download.pytorch.org/whl/cu121
+```bash
+pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
 
 pip install "transformers[serving] @ git+https://github.com/huggingface/transformers.git@main"
-​```
+```
 
-> **Note**: `transformers`를 main 브랜치에서 설치하는 이유는 Qwen3.5 모델이 안정 버전(release)에 아직 포함되지 않았기 때문입니다.
+> **Note**: `transformers`를 main 브랜치에서 설치하는 이유는 Qwen 모델이 안정 버전(release)에 아직 포함되지 않았기 때문입니다.
 
 #### Hugging Face Token 설정
 
-본 프로젝트는 Hugging Face에서 Qwen3.5 모델을 다운로드하기 위해 사용자 토큰이 필요할 수 있습니다.
+본 프로젝트는 Hugging Face에서 Qwen 모델을 다운로드하기 위해 사용자 토큰이 필요할 수 있습니다.
 
 1. [Hugging Face Settings → Access Tokens](https://huggingface.co/settings/tokens)에서 Access Token을 발급합니다.
 2. 프로젝트 루트 디렉토리에 `.env` 파일을 생성합니다.
 3. 아래와 같이 토큰을 입력합니다.
 
-​```bash
+```bash
 # .env
 HF_TOKEN=your_huggingface_token_here
-​```
+```
 
 > ⚠️ **Security**: `.env` 파일은 절대 Git에 커밋하지 마세요. `.gitignore`에 `.env`가 포함되어 있는지 확인하시기 바랍니다.
 
