@@ -10,7 +10,8 @@
     "actual": {
       "move": "left",
       "status": "ok",
-      "target": "cup"
+      "target": "cup",
+      "task": "가져오기"
     }
   },
   "01_R": {
@@ -24,7 +25,8 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "cup"
+      "target": "cup",
+      "task": "가져오기"
     }
   },
   "02": {
@@ -38,7 +40,8 @@
     "actual": {
       "move": "left",
       "status": "ok",
-      "target": "couch"
+      "target": "couch",
+      "task": "주위 돌며 알리기"
     }
   },
   "03": {
@@ -52,7 +55,8 @@
     "actual": {
       "move": "left",
       "status": "ok",
-      "target": "bed"
+      "target": "bed",
+      "task": "눕기"
     }
   },
   "04": {
@@ -66,7 +70,8 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "bed"
+      "target": "bed",
+      "task": "조명 제어"
     }
   },
   "05": {
@@ -80,7 +85,8 @@
     "actual": {
       "move": "left",
       "status": "ok",
-      "target": "chair"
+      "target": "chair",
+      "task": "주위 돌며 알리기"
     }
   },
   "06": {
@@ -94,7 +100,8 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "chair"
+      "target": "chair",
+      "task": "주위 돌며 알리기"
     }
   },
   "07": {
@@ -108,7 +115,8 @@
     "actual": {
       "move": "front",
       "status": "...",
-      "target": "bed"
+      "target": "bed",
+      "task": "조명 제어"
     }
   },
   "08": {
@@ -122,7 +130,8 @@
     "actual": {
       "move": "front",
       "status": "...",
-      "target": "couch"
+      "target": "couch",
+      "task": "주위 돌며 알리기"
     }
   },
   "09": {
@@ -136,7 +145,8 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "bed"
+      "target": "bed",
+      "task": "조명 제어"
     }
   },
   "10": {
@@ -150,7 +160,8 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "toilet"
+      "target": "toilet",
+      "task": "열기"
     }
   },
   "11": {
@@ -177,7 +188,8 @@
     "actual": {
       "move": "left",
       "status": "ok",
-      "target": "chair"
+      "target": "chair",
+      "task": "주위 돌며 알리기"
     }
   },
   "13": {
@@ -191,7 +203,8 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "bed"
+      "target": "bed",
+      "task": "조명 제어"
     }
   },
   "14": {
@@ -205,7 +218,8 @@
     "actual": {
       "move": "left",
       "status": "ok",
-      "target": "couch"
+      "target": "couch",
+      "task": "주위 돌며 알리기"
     }
   },
   "15": {
@@ -245,7 +259,8 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "bed"
+      "target": "bed",
+      "task": "조명 제어"
     }
   },
   "18": {
@@ -259,7 +274,8 @@
     "actual": {
       "move": "front",
       "status": "success",
-      "target": "cup"
+      "target": "cup",
+      "task": "가져오기"
     }
   }
 }
