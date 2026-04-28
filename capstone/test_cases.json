@@ -1,4 +1,28 @@
 {
+  "0": {
+    "title": "간접 욕구 - 목마름",
+    "image_path": "test image/test.jpg",
+    "command": "아 너무 목말라..",
+    "expected": {
+      "target": "cup",
+      "move": "front"
+    },
+    "actual": {
+      "status": "success",
+      "target": "cup",
+      "bbox_center_x": 2379.12,
+      "image_center_x": 2368.5,
+      "pixel_offset": 10.62,
+      "yaw_deg": 0.0,
+      "turn_direction": "center",
+      "aligned": true,
+      "distance": 1.7,
+      "target_distance": 1.0,
+      "distance_error": 0.7,
+      "move": "front",
+      "linear_distance": 0.7
+    }
+  },
   "01_L": {
     "title": "간접 욕구 - 목마름",
     "image_path": "test image/test_01_L.jpg",
@@ -9,9 +33,8 @@
     },
     "actual": {
       "move": "left",
-      "status": "ok",
-      "target": "cup",
-      "task": "가져오기"
+      "status": "completed",
+      "target": "cup"
     }
   },
   "01_R": {
@@ -25,8 +48,7 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "cup",
-      "task": "가져오기"
+      "target": "cup"
     }
   },
   "02": {
@@ -35,13 +57,22 @@
     "command": "다리가 아프니 좀 쉬어야겠어.",
     "expected": {
       "target": "chair",
-      "move": "left"
+      "move": "right"
     },
     "actual": {
-      "move": "left",
-      "status": "ok",
-      "target": "couch",
-      "task": "주위 돌며 알리기"
+      "status": "success",
+      "target": "chair",
+      "bbox_center_x": 841.97,
+      "image_center_x": 512.0,
+      "pixel_offset": 329.97,
+      "yaw_deg": 24.29,
+      "turn_direction": "right",
+      "aligned": false,
+      "distance": 1.7,
+      "target_distance": 1.0,
+      "distance_error": 0.7,
+      "move": "hold",
+      "linear_distance": 0.0
     }
   },
   "03": {
@@ -55,8 +86,7 @@
     "actual": {
       "move": "left",
       "status": "ok",
-      "target": "bed",
-      "task": "눕기"
+      "target": "bed"
     }
   },
   "04": {
@@ -70,8 +100,7 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "bed",
-      "task": "조명 제어"
+      "target": "bed"
     }
   },
   "05": {
@@ -84,9 +113,8 @@
     },
     "actual": {
       "move": "left",
-      "status": "ok",
-      "target": "chair",
-      "task": "주위 돌며 알리기"
+      "status": "...",
+      "target": "chair"
     }
   },
   "06": {
@@ -100,8 +128,7 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "chair",
-      "task": "주위 돌며 알리기"
+      "target": "chair"
     }
   },
   "07": {
@@ -115,8 +142,7 @@
     "actual": {
       "move": "front",
       "status": "...",
-      "target": "bed",
-      "task": "조명 제어"
+      "target": "bed"
     }
   },
   "08": {
@@ -130,8 +156,7 @@
     "actual": {
       "move": "front",
       "status": "...",
-      "target": "couch",
-      "task": "주위 돌며 알리기"
+      "target": "couch"
     }
   },
   "09": {
@@ -145,8 +170,7 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "bed",
-      "task": "조명 제어"
+      "target": "bed"
     }
   },
   "10": {
@@ -160,8 +184,7 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "toilet",
-      "task": "열기"
+      "target": "toilet"
     }
   },
   "11": {
@@ -188,8 +211,7 @@
     "actual": {
       "move": "left",
       "status": "ok",
-      "target": "chair",
-      "task": "주위 돌며 알리기"
+      "target": "chair"
     }
   },
   "13": {
@@ -203,8 +225,7 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "bed",
-      "task": "조명 제어"
+      "target": "bed"
     }
   },
   "14": {
@@ -218,8 +239,7 @@
     "actual": {
       "move": "left",
       "status": "ok",
-      "target": "couch",
-      "task": "주위 돌며 알리기"
+      "target": "couch"
     }
   },
   "15": {
@@ -259,8 +279,7 @@
     "actual": {
       "move": "right",
       "status": "...",
-      "target": "bed",
-      "task": "조명 제어"
+      "target": "bed"
     }
   },
   "18": {
@@ -274,8 +293,49 @@
     "actual": {
       "move": "front",
       "status": "success",
+      "target": "cup"
+    }
+  },
+  "ob1" : {
+    "title": "간접 욕구 - 목마름",
+    "image_path": "test image/test_ob1.jpg",
+    "command": "목이 타네",
+    "expected": {
       "target": "cup",
-      "task": "가져오기"
+      "move": "front"
+    },
+    "actual": {
+      "move": "front",
+      "status": "success",
+      "target": "cup"
+    }
+  },
+  "ob2" : {
+    "title": "간접 욕구 - 목마름",
+    "image_path": "test image/test_ob2.jpg",
+    "command": "목이 타네",
+    "expected": {
+      "target": "cup",
+      "move": ""
+    },
+    "actual": {
+      "move": "front",
+      "status": "success",
+      "target": "cup"
+    }
+  },
+  "ob3" : {
+    "title": "간접 욕구 - 목마름",
+    "image_path": "test image/test_ob3.jpg",
+    "command": "목이 타네",
+    "expected": {
+      "target": "cup",
+      "move": ""
+    },
+    "actual": {
+      "move": "front",
+      "status": "success",
+      "target": "cup"
     }
   }
 }
