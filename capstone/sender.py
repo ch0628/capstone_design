@@ -20,7 +20,7 @@ class ImageSender(Node):
         self.get_logger().info('✅ 세라프 서버 터널 연결 완료')
 
         self.color_sub = message_filters.Subscriber(self, Image, '/camera/color/image_raw')
-        self.depth_sub = message_filters.Subscriber(self, Image, '/camera/depth/image_rect_raw')
+        self.depth_sub = message_filters.Subscriber(self, Image, '/camera/aligned_depth_to_color/image_raw')
         ts = message_filters.ApproximateTimeSynchronizer([self.color_sub, self.depth_sub], 10, 0.1)
         ts.registerCallback(self.image_callback)
 
