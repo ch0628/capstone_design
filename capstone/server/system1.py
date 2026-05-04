@@ -37,10 +37,16 @@ class MotionExecutor:
         self.avoid_turn_max_deg = 30.0        # 회피 각도 상한
         self.avoid_forward_m = 0.5            # 회피 시 전진 거리
 
+        # 한 사이클당 최대 이동/회전 (안전: 짧게 끊어서 카메라 재확인)
+        self.max_forward_per_cycle_m = 0.4    # 한 번에 최대 40cm
+        self.max_turn_per_cycle_deg = 20.0    # 한 번에 최대 20도
+
         # 추후: serial.Serial("/dev/ttyACM0", 9600) 등으로 Arduino 연결
         self.motor_log = []  # 디버깅용 모터 명령 로그
 
         print("✅ System1(MotionExecutor) 준비 완료 (mock 모드)")
+        print(f"   max_forward_per_cycle = {self.max_forward_per_cycle_m}m")
+        print(f"   max_turn_per_cycle = {self.max_turn_per_cycle_deg}deg")
 
     # ── 모터 명령 (mock) ───────────────────────────────────────
 
@@ -70,6 +76,7 @@ class MotionExecutor:
         """
         추적 실행. 정렬 안 되면 회전, 정렬됐으면 전진/후진.
         한 사이클에 한 동작만 (다음 카메라 프레임에서 재평가).
+        max_forward_per_cycle_m, max_turn_per_cycle_deg로 한 사이클당 제한.
         """
         target = context["target"]
         config = context["config"]
@@ -79,7 +86,9 @@ class MotionExecutor:
         if not target["aligned"]:
             yaw = target["yaw_deg"]
             direction = "left" if yaw < 0 else "right"
-            executed.append(self._motor_turn(direction, abs(yaw)))
+            # 한 번에 최대 max_turn_per_cycle_deg까지만 회전
+            turn_amount = min(abs(yaw), self.max_turn_per_cycle_deg)
+            executed.append(self._motor_turn(direction, turn_amount))
             return executed, "continue"
 
         # 정렬됐으면 거리 조정
@@ -87,10 +96,14 @@ class MotionExecutor:
         tolerance = config["distance_tolerance_m"]
 
         if distance_error > tolerance:
-            executed.append(self._motor_move("front", distance_error))
+            # 한 번에 최대 max_forward_per_cycle_m까지만 전진
+            move_dist = min(distance_error, self.max_forward_per_cycle_m)
+            executed.append(self._motor_move("front", move_dist))
             return executed, "continue"
         elif distance_error < -tolerance:
-            executed.append(self._motor_move("back", abs(distance_error)))
+            # 후진도 동일 제한 적용
+            move_dist = min(abs(distance_error), self.max_forward_per_cycle_m)
+            executed.append(self._motor_move("back", move_dist))
             return executed, "continue"
         else:
             # 정렬됐고 거리도 OK면 사실상 stop_at_target 케이스인데,

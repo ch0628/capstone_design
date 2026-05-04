@@ -1,3 +1,17 @@
+"""
+sender.py — RPi 메인 (모터 통합 버전)
+
+원래 구조:
+  Enter 입력 → 프레임 송신 → 응답 수신 → Enter 입력 → ...
+
+새 구조:
+  프레임 송신 → 응답 수신 → 모터 실행(블로킹) → 자동으로 다음 프레임 송신 → ...
+  next_action_hint이 done/wait_user/abort일 때만 사용자 입력 대기.
+
+서버는 그대로(MotionExecutor mock 유지). 서버가 보낸 executed_motions 문자열을
+RPi의 MotorDriver(PCA9685)가 받아서 실제 모터를 돌린다.
+"""
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
@@ -10,29 +24,30 @@ import struct
 import time
 import json
 
+from motor import MotorDriver
+
 
 SERVER_HOST = 'localhost'
 SERVER_PORT = 9999
 
-# task가 끝났음을 의미하는 hint들 → 새 명령 받을지 물어봐야 함
+# task가 끝났음을 의미하는 hint들 → 사용자 입력 대기
 TASK_END_HINTS = {'done', 'wait_user', 'abort'}
+
+# 첫 프레임 들어올 때까지 최대 대기 시간
+INITIAL_FRAME_TIMEOUT_S = 10.0
 
 
 class ImageSender(Node):
-    """
-    백그라운드에서 RealSense 토픽을 계속 구독하면서 최신 프레임을 보관.
-    실제 송신은 외부에서 send_one_shot()을 호출할 때만 일어남.
-    """
+    """RealSense 토픽 백그라운드 구독, 최신 프레임 보관."""
     def __init__(self):
         super().__init__('image_sender')
         self.bridge = CvBridge()
 
-        # 최신 프레임 보관소 (콜백이 갱신, 메인 루프가 읽음)
         self._frame_lock = threading.Lock()
-        self._latest_color = None   # numpy bgr8
-        self._latest_depth = None   # numpy uint16 (mm)
-        self._latest_stamp = None   # 프레임 수신 시각 (monotonic, 디버그용)
-        self._frame_count = 0       # 누적 수신 프레임 수
+        self._latest_color = None
+        self._latest_depth = None
+        self._latest_stamp = None
+        self._frame_count = 0
 
         self.color_sub = message_filters.Subscriber(
             self, Image, '/camera/color/image_raw')
@@ -59,17 +74,24 @@ class ImageSender(Node):
             self._frame_count += 1
 
     def get_latest_frame(self):
-        """메인 루프가 송신할 때 호출. 최신 프레임 스냅샷 반환."""
         with self._frame_lock:
             if self._latest_color is None or self._latest_depth is None:
                 return None
-            # copy: 콜백이 덮어써도 송신 중인 데이터가 안 망가지게
             return (
                 self._latest_color.copy(),
                 self._latest_depth.copy(),
                 self._latest_stamp,
                 self._frame_count,
             )
+
+    def wait_for_first_frame(self, timeout_s=INITIAL_FRAME_TIMEOUT_S):
+        """첫 프레임 들어올 때까지 대기. 타임아웃 시 False."""
+        start = time.time()
+        while time.time() - start < timeout_s:
+            if self.get_latest_frame() is not None:
+                return True
+            time.sleep(0.1)
+        return False
 
 
 def recv_all(sock, count):
@@ -86,13 +108,9 @@ def recv_all(sock, count):
 def send_one_shot(color_img, depth_img, command_to_send):
     """
     매 호출마다 새 소켓 연결 → 송신 → 응답 수신 → 닫기.
-    서버는 무한 루프로 다음 연결을 기다리는 구조라 이게 깔끔함.
-
     command_to_send: str | None
-        - 문자열이면 cmd_size>0으로 동봉 (서버가 명령 갱신)
-        - None이면 cmd_size=0 (서버가 마지막 명령 재사용)
     """
-    t_pi_start = time.time()  # 서버랑 시간 비교해야 하니 wall clock 유지
+    t_pi_start = time.time()
 
     _, color_encoded = cv2.imencode('.jpg', color_img)
     color_data = color_encoded.tobytes()
@@ -103,8 +121,6 @@ def send_one_shot(color_img, depth_img, command_to_send):
     else:
         cmd_data = b''
 
-    # 헤더: <IQQd>
-    #   cmd_size, rgb_size, depth_size, t_pi_start
     header = struct.pack(
         '<IQQd',
         len(cmd_data),
@@ -193,9 +209,7 @@ def print_stats(res, t_start, t_end):
 
 
 def prompt_initial_command():
-    """
-    프로그램 시작 시 명령 강제 입력. 빈 입력이나 q면 None 반환 (종료).
-    """
+    """프로그램 시작 시 명령 강제 입력. 빈 입력이나 q면 None."""
     print('\n[SERAPH RPi Sender]')
     print('  로봇에게 시킬 일을 자연어로 입력하세요.')
     print('  예시: "목 마르네", "리모컨 가져와", "책 좀"')
@@ -208,7 +222,7 @@ def prompt_initial_command():
 
 def prompt_after_task_end(current_command, hint):
     """
-    task가 끝난 상태(done/wait_user/abort)에서의 입력 분기.
+    task 종료(done/wait_user/abort) 시 사용자 입력 분기.
 
     Returns:
         ('continue', None)        : 같은 명령 재시도
@@ -234,95 +248,124 @@ def prompt_after_task_end(current_command, hint):
     return 'new_command', user_input
 
 
-def prompt_continue(current_command):
+def run_one_cycle(node, motor, current_command, command_dirty):
     """
-    task 진행 중(continue/reevaluate)일 때 단순 Enter 트리거.
-    Returns: True if 계속, False if 종료
+    한 사이클 실행: 프레임 송신 → 응답 수신 → 모터 실행.
+
+    Returns:
+        (success, result_dict, new_command_dirty)
+        success: True if 사이클 정상 완료, False if 송수신 실패
+        result_dict: 서버 응답 (실패 시 None)
+        new_command_dirty: 다음 사이클에 명령 재전송 필요 여부
     """
-    user_input = input(
-        f">>> Enter로 다음 프레임 송신 [명령: '{current_command}'] (q: 종료): "
-    ).strip().lower()
-    return user_input != 'q'
+    snapshot = node.get_latest_frame()
+    if snapshot is None:
+        print('⚠ 카메라 프레임이 아직 없음. 0.2초 후 재시도.')
+        time.sleep(0.2)
+        return False, None, command_dirty
+
+    color_img, depth_img, stamp, count = snapshot
+    cmd_to_send = current_command if command_dirty else None
+    cmd_indicator = "+ 명령" if command_dirty else "(명령 생략)"
+    print(f'\n→ 프레임 #{count} 송신 중 {cmd_indicator}...')
+
+    # 송신
+    try:
+        result, t_start, t_end = send_one_shot(color_img, depth_img, cmd_to_send)
+    except Exception as e:
+        node.get_logger().error(f'송신/수신 실패: {e}')
+        return False, None, command_dirty   # dirty 유지 → 다음 시도에 명령 재전송
+
+    # 송신 성공 → 서버가 명령을 알고 있음
+    new_dirty = False if command_dirty else False
+
+    print_stats(result, t_start, t_end)
+
+    # 에러 응답 처리
+    if result.get('status') == 'error':
+        reason = result.get('reason', 'unknown')
+        print(f'⚠ 서버 에러: {reason}')
+        if reason == 'no_command_set':
+            new_dirty = True   # 서버가 명령을 잃어버림 → 재전송
+        return True, result, new_dirty
+
+    # 모터 실행 (블로킹)
+    execution = result.get('execution') or {}
+    motions = execution.get('executed_motions', [])
+    if motions:
+        motor.execute_motions(motions)
+    else:
+        print('   (실행할 모터 명령 없음)')
+
+    return True, result, new_dirty
 
 
 def main():
     rclpy.init()
     node = ImageSender()
 
-    # rclpy.spin을 백그라운드 스레드로 돌려서 콜백이 계속 latest_frame을 갱신
+    # 백그라운드 spin
     spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()
 
-    # 1) 시작 시 명령 강제 입력
+    # 모터 초기화
+    motor = MotorDriver()
+    
+
+    # 1) 명령 입력
     current_command = prompt_initial_command()
     if current_command is None:
         print('명령 없이 종료합니다.')
+        motor.cleanup()
         node.destroy_node()
         rclpy.shutdown()
         return
 
-    command_dirty = True   # 첫 송신엔 무조건 명령 동봉
-    last_hint = None       # 직전 응답의 next_action_hint
+    # 첫 프레임 대기
+    print('\n📷 첫 카메라 프레임 대기 중...')
+    if not node.wait_for_first_frame():
+        print('❌ 카메라 프레임이 안 들어옵니다. RealSense 노드 확인 필요.')
+        motor.cleanup()
+        node.destroy_node()
+        rclpy.shutdown()
+        return
+    print('✅ 카메라 OK. 작업 시작.')
+
+    command_dirty = True
+    last_hint = None
 
     try:
         while True:
-            # 2) hint에 따라 프롬프트 분기
-            if last_hint is None or last_hint not in TASK_END_HINTS:
-                # 첫 진입 또는 진행 중(continue/reevaluate) → 단순 Enter
-                if not prompt_continue(current_command):
-                    break
-            else:
-                # task 종료 → 재시도/새명령/종료 선택
-                # (운영 시엔 이 자리를 아두이노 시그널 + UI로 대체)
+            # 2) 직전 hint에 따라 분기
+            if last_hint in TASK_END_HINTS:
+                # task 종료 → 사용자 입력 받기
                 action, new_cmd = prompt_after_task_end(current_command, last_hint)
                 if action == 'quit':
                     break
                 if action == 'new_command':
                     current_command = new_cmd
                     command_dirty = True
-                # 'continue'면 그대로 진행 (command_dirty 유지)
+                # 'continue'면 그대로 진행
+                last_hint = None   # 새 사이클 시작
+            # else: continue / reevaluate / 첫 진입 → 자동으로 다음 사이클 진행
 
-            # 3) 최신 프레임 가져오기
-            snapshot = node.get_latest_frame()
-            if snapshot is None:
-                print('⚠ 아직 카메라 프레임이 안 들어왔어. 잠시 후 다시 시도.')
+            # 3) 한 사이클 실행 (송신 → 모터까지 블로킹)
+            success, result, command_dirty = run_one_cycle(
+                node, motor, current_command, command_dirty
+            )
+
+            if not success:
+                # 송수신 실패 → 잠시 후 재시도
                 continue
 
-            color_img, depth_img, stamp, count = snapshot
-            cmd_to_send = current_command if command_dirty else None
-            cmd_indicator = "+ 명령" if command_dirty else "(명령 생략)"
-            print(f'  → 프레임 #{count} 송신 중 {cmd_indicator}...')
-
-            # 4) 송신
-            try:
-                result, t_start, t_end = send_one_shot(
-                    color_img, depth_img, cmd_to_send
-                )
-                # 송신 성공 → 서버가 명령을 알고 있음
-                if command_dirty:
-                    command_dirty = False
-
-                print_stats(result, t_start, t_end)
-
-                # next_hint 갱신
-                execution = result.get('execution') or {}
-                last_hint = execution.get('next_action_hint')
-
-                # 에러 응답 처리
-                if result.get('status') == 'error':
-                    reason = result.get('reason', 'unknown')
-                    print(f'⚠ 서버 에러: {reason}')
-                    if reason == 'no_command_set':
-                        # 서버가 명령을 잃어버림 → 다음 송신에 재동봉
-                        command_dirty = True
-
-            except Exception as e:
-                node.get_logger().error(f'송신/수신 실패: {e}')
-                # 송신 실패면 dirty 유지 (다음 시도에 명령 다시 보냄)
+            # 4) next_hint 갱신 → 루프 위에서 분기 결정
+            execution = result.get('execution') or {}
+            last_hint = execution.get('next_action_hint')
 
     except KeyboardInterrupt:
         print('\n중단됨')
     finally:
+        motor.cleanup()
         node.destroy_node()
         rclpy.shutdown()
         print('정리 완료. 종료.')

@@ -83,7 +83,7 @@ class VisionPlanner:
         self.max_avoidance_attempts = 3
 
         # 시스템 설정
-        self.target_distance_m = 1.0
+        self.target_distance_m = 0.3
 
         print("✅ System2(VisionPlanner) 준비 완료")
 
