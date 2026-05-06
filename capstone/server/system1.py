@@ -208,7 +208,12 @@ class MotionExecutor:
         current_attempts = context.get("avoidance_attempts", 0)
 
         # 행동별 분기
-        if action == "track":
+        if action == "emergency_stop":
+            executed = [self._motor_stop()]
+            print("🚨 [긴급 제동] 로봇 바로 앞에 장애물이 감지되어 정지합니다.")
+            hint = "reevaluate"
+            next_attempts = current_attempts
+        elif action == "track":
             executed, hint = self._execute_track(context)
             next_attempts = 0  # 정상 추적 복귀 시 카운트 리셋
         elif action == "avoid_obstacle":
