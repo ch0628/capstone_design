@@ -157,6 +157,45 @@ def send_response(conn, response_dict):
     conn.sendall(header + body)
 
 
+def _print_plan_diagnostics(action_command):
+    """장애물 인식 디버깅용 진단 출력."""
+    status = action_command.get("status")
+    action = action_command.get("action")
+    
+    # VLM 출력 확인
+    plan_data = action_command.get("plan", {})
+    if plan_data:
+        vlm_target = plan_data.get("target_object")
+        vlm_obstacles = plan_data.get("obstacle_classes", [])
+        vlm_reasoning = plan_data.get("reasoning", "")
+        print(f"🧠 [VLM] target={vlm_target}, obstacle_classes={vlm_obstacles}")
+        if vlm_reasoning:
+            print(f"   reasoning: {vlm_reasoning}")
+    
+    # 장애물 상세 (success 케이스)
+    if status == "success":
+        context = action_command.get("context", {})
+        target = context.get("target", {})
+        blocking = context.get("blocking_obstacles", [])
+        
+        target_dist = target.get("distance", 0)
+        target_yaw = target.get("yaw_deg", 0)
+        target_aligned = target.get("aligned", False)
+        print(f"🎯 [Target] {target.get('class')} "
+              f"dist={target_dist:.2f}m yaw={target_yaw:+.1f}° aligned={target_aligned}")
+        
+        print(f"🚧 [Blocking] {len(blocking)}건 (action={action})")
+        for b in blocking:
+            print(f"   - {b.get('class')} "
+                  f"dist={b.get('distance', 0):.2f}m "
+                  f"yaw={b.get('yaw_deg', 0):+.1f}° "
+                  f"conf={b.get('conf', 0):.2f}")
+    
+    # abort/retry 사유
+    if status in ("abort", "retry"):
+        print(f"⚠️  [{status}] 사유: {action_command.get('reason', 'unknown')}")
+
+
 def handle_one_request(conn, planner, executor, cmd_state):
     """
     한 사이클 처리:
@@ -222,9 +261,8 @@ def handle_one_request(conn, planner, executor, cmd_state):
     )
     t_plan_done = time.time()
 
-    # plan 결과 진단 출력
-    if action_command.get("status") == "abort":
-        print(f"⚠️  [System2] abort 사유: {action_command.get('reason', 'unknown')}")
+    # 3-1. 진단 출력 (VLM + 장애물 상세)
+    _print_plan_diagnostics(action_command)
 
     # 4. execute 호출 (System 1)
     t_exec_start = time.time()

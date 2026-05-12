@@ -40,7 +40,7 @@ OBJECT_POOL = [
     "remote", "cell phone", "book", "laptop", "keyboard", "mouse",
     "handbag", "backpack", "suitcase", "scissors",
     "tv", "refrigerator", "oven", "microwave", "sink",
-    "person", "potted plant",
+    "person", "potted plant", "cap", "hat"
 ]
 
 
@@ -145,17 +145,18 @@ class VisionPlanner:
 Your goal is to solve the user's problem by identifying the most appropriate object in the scene.
 
 STEP-BY-STEP REASONING:
-1. Analyze the user's command to identify their current state (e.g., hot, tired, thirsty, bored).
-2. Determine the physical property or function needed to improve that state (e.g., cooling, comfort, hydration, entertainment).
-3. Evaluate objects in the image from the ALLOWED CLASSES to find the best match for that property.
+1. Analyze the user's command to identify their current state.
+2. Determine the physical property or function needed to improve that state.
+3. Evaluate objects in the image from the ALLOWED CLASSES to find the best match.
+4. Identify ALL other objects from the ALLOWED CLASSES that appear in the image.
 
 ALLOWED CLASSES (use these only):
 [{pool_str}]
 
 STRICT RULES:
 - target_object: MUST be clearly visible and the best solution for the user's state. If no solution is visible, set to null.
-- reasoning: A very short one-sentence explanation of why this object was chosen based on the user's state (e.g., "User is hot, so I found a cold drink bottle.").
-- obstacle_classes: Objects between the robot and the target.
+- reasoning: A very short one-sentence explanation of why this object was chosen.
+- obstacle_classes: List EVERY OTHER object from the ALLOWED CLASSES that you can see in the image (besides the target). Do NOT include the target itself. Be thorough - if you see ANY object from the list, include it. The downstream system will filter which ones actually block the path.
 
 Output format (ONE JSON object only):
 {{"intent": "<verb>", "state_analysis": "<user's state>", "reasoning": "<short explanation>", "target_object": "<class or null>", "obstacle_classes": ["<class>", ...]}}
@@ -302,6 +303,16 @@ Output format (ONE JSON object only):
             target_det, obstacle_dets = self.detect_objects(pil_img, plan["target_object"], plan["obstacle_classes"])
             timings["yolo_ms"] = round((time.time() - t_yolo) * 1000, 2)
 
+            # ★ 진단: YOLO 검출 결과
+            print(f"   🔍 [YOLO] target_det={'O' if target_det else 'X'}, obstacle_dets={len(obstacle_dets)}건")
+            if target_det:
+                print(f"   🎯 [YOLO target] bbox={[round(v,1) for v in target_det['bbox']]} "
+                      f"conf={target_det['conf']:.3f}")
+            for od in obstacle_dets:
+                print(f"   🚧 [YOLO obstacle] {od['class']} "
+                      f"bbox={[round(v,1) for v in od['bbox']]} "
+                      f"conf={od['conf']:.3f}")
+
             if target_det is None:
                 return {
                     "status": "retry",
@@ -326,7 +337,15 @@ Output format (ONE JSON object only):
             for od in obstacle_dets:
                 og = self.compute_geometry(od["bbox"], img_w, img_h)
                 odist = self._read_depth_at_bbox(depth_map, od["bbox"]) or (target_distance - 0.01)
-                blocking, _ = self.is_blocking_obstacle(og, odist, target_geom, target_distance)
+                blocking, reason = self.is_blocking_obstacle(og, odist, target_geom, target_distance)
+                
+                # ★ 진단: 장애물 필터링 상세
+                print(f"   🔍 [obstacle filter] {od['class']} "
+                      f"conf={od['conf']:.2f} "
+                      f"dist={odist:.2f}m yaw={og['yaw_deg']:+.1f}° "
+                      f"area={og['area_ratio']:.3f} "
+                      f"→ {'BLOCKING' if blocking else f'skip({reason})'}")
+                
                 if blocking:
                     # system1이 회피 거리/방향 계산 시 사용하도록 yaw, distance 추가
                     od_with_info = {
