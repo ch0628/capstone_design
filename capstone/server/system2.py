@@ -11,7 +11,8 @@ System 2 — VisionPlanner
   - "stop_at_target"  : 목표 거리 도달, 정지
   - "wait_user"       : 사용자 개입 대기 (회피 한도 초과 등)
   - "emergency_stop"  : 긴급 제동 (충돌 위험)
-  - "abort"           : 실패 (target 못 찾음, VLM 파싱 실패 등)
+  - "retry"           : 일시적 실패, 다음 프레임에서 재시도
+  - "abort"           : 시스템 에러 (예외 발생)
 
 핵심 인터페이스:
     planner.plan(image_path, command, depth_map, avoidance_attempts)
@@ -289,7 +290,12 @@ Output format (ONE JSON object only):
             timings["vlm_ms"] = round((time.time() - t_vlm) * 1000, 2)
 
             if plan is None or not plan["target_object"]:
-                return {"status": "abort", "action": "abort", "reason": "no_target", "timings": timings}
+                return {
+                    "status": "retry",
+                    "action": "retry",
+                    "reason": "no_target",
+                    "timings": timings,
+                }
 
             # 3. YOLO
             t_yolo = time.time()
@@ -297,12 +303,23 @@ Output format (ONE JSON object only):
             timings["yolo_ms"] = round((time.time() - t_yolo) * 1000, 2)
 
             if target_det is None:
-                return {"status": "abort", "action": "abort", "reason": "target_not_found", "timings": timings}
+                return {
+                    "status": "retry",
+                    "action": "retry",
+                    "reason": "target_not_found",
+                    "timings": timings,
+                }
 
             # 4. Post-processing
             t_post = time.time()
             target_distance = self._read_depth_at_bbox(depth_map, target_det["bbox"])
-            if target_distance is None: return {"status": "abort", "action": "abort", "reason": "depth_error", "timings": timings}
+            if target_distance is None:
+                return {
+                    "status": "retry",
+                    "action": "retry",
+                    "reason": "target_depth_unavailable",
+                    "timings": timings,
+                }
 
             target_geom = self.compute_geometry(target_det["bbox"], img_w, img_h)
             blocking_obstacles = []
@@ -310,13 +327,21 @@ Output format (ONE JSON object only):
                 og = self.compute_geometry(od["bbox"], img_w, img_h)
                 odist = self._read_depth_at_bbox(depth_map, od["bbox"]) or (target_distance - 0.01)
                 blocking, _ = self.is_blocking_obstacle(og, odist, target_geom, target_distance)
-                if blocking: blocking_obstacles.append(od)
+                if blocking:
+                    # system1이 회피 거리/방향 계산 시 사용하도록 yaw, distance 추가
+                    od_with_info = {
+                        **od,
+                        "yaw_deg": og["yaw_deg"],
+                        "distance": odist,
+                    }
+                    blocking_obstacles.append(od_with_info)
 
             target_info = {"class": target_det["class"], "aligned": target_geom["aligned"], "distance": target_distance}
             action = self.select_action(target_info, blocking_obstacles, avoidance_attempts, is_emergency)
 
             context = {
                 "target": {"class": target_det["class"], "bbox": target_det["bbox"], "yaw_deg": target_geom["yaw_deg"], "aligned": target_geom["aligned"], "distance": target_distance, "distance_error": target_distance - self.target_distance_m},
+                "blocking_obstacles": blocking_obstacles,
                 "image": {"width": img_w, "height": img_h, "hfov_deg": self.hfov_deg},
                 "config": {"target_distance_m": self.target_distance_m, "distance_tolerance_m": self.distance_tolerance_m, "center_tolerance_px": self.center_tolerance_px},
                 "avoidance_attempts": avoidance_attempts,
