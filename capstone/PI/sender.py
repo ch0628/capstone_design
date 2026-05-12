@@ -1,12 +1,10 @@
 """
 sender.py — RPi 메인 (모터 통합 버전)
 
-원래 구조:
-  Enter 입력 → 프레임 송신 → 응답 수신 → Enter 입력 → ...
-
-새 구조:
+구조:
   프레임 송신 → 응답 수신 → 모터 실행(블로킹) → 자동으로 다음 프레임 송신 → ...
-  next_action_hint이 done/wait_user/abort일 때만 사용자 입력 대기.
+  next_action_hint이 done/wait_user/abort/proximity일 때만 사용자 입력 대기.
+  retry hint는 자동으로 다음 사이클 진행, MAX_RETRY 초과 시 케이스별 처리.
 
 서버는 그대로(MotionExecutor mock 유지). 서버가 보낸 executed_motions 문자열을
 RPi의 MotorDriver(PCA9685)가 받아서 실제 모터를 돌린다.
@@ -31,10 +29,13 @@ SERVER_HOST = 'localhost'
 SERVER_PORT = 9999
 
 # task가 끝났음을 의미하는 hint들 → 사용자 입력 대기
-TASK_END_HINTS = {'done', 'wait_user', 'abort'}
+TASK_END_HINTS = {'done', 'wait_user', 'abort', 'proximity'}
 
 # 첫 프레임 들어올 때까지 최대 대기 시간
 INITIAL_FRAME_TIMEOUT_S = 10.0
+
+# retry 한도 (이 횟수 초과 시 케이스별 처리)
+MAX_RETRY = 3
 
 
 class ImageSender(Node):
@@ -179,8 +180,8 @@ def print_stats(res, t_start, t_end):
     print(f"[명령]  {res.get('command', 'N/A')}")
     print(f"[결과]  status={status}, action={action}, next={next_hint}")
 
-    if status in ('abort', 'error'):
-        print(f"[중단]  reason={reason}")
+    if status in ('abort', 'error', 'retry'):
+        print(f"[사유]  reason={reason}")
     else:
         if target:
             dist = target.get('distance')
@@ -222,7 +223,7 @@ def prompt_initial_command():
 
 def prompt_after_task_end(current_command, hint):
     """
-    task 종료(done/wait_user/abort) 시 사용자 입력 분기.
+    task 종료(done/wait_user/abort/proximity) 시 사용자 입력 분기.
 
     Returns:
         ('continue', None)        : 같은 명령 재시도
@@ -235,6 +236,8 @@ def prompt_after_task_end(current_command, hint):
         print('\n⚠️  로봇이 막혔습니다. 장애물을 치워주세요.')
     elif hint == 'abort':
         print('\n❌ 작업이 중단되었습니다.')
+    elif hint == 'proximity':
+        print('\n🎯 타겟에 너무 가까이 접근했습니다. (근접 로직은 팀원 작업 대기 중)')
 
     print(f"  Enter      : 같은 명령으로 재시도 ('{current_command}')")
     print(f"  <텍스트>   : 새 명령으로 변경")
@@ -277,7 +280,7 @@ def run_one_cycle(node, motor, current_command, command_dirty):
         return False, None, command_dirty   # dirty 유지 → 다음 시도에 명령 재전송
 
     # 송신 성공 → 서버가 명령을 알고 있음
-    new_dirty = False if command_dirty else False
+    new_dirty = False
 
     print_stats(result, t_start, t_end)
 
@@ -310,7 +313,6 @@ def main():
 
     # 모터 초기화
     motor = MotorDriver()
-    
 
     # 1) 명령 입력
     current_command = prompt_initial_command()
@@ -333,6 +335,8 @@ def main():
 
     command_dirty = True
     last_hint = None
+    retry_count = 0
+    last_retry_reason = None
 
     try:
         while True:
@@ -347,7 +351,9 @@ def main():
                     command_dirty = True
                 # 'continue'면 그대로 진행
                 last_hint = None   # 새 사이클 시작
-            # else: continue / reevaluate / 첫 진입 → 자동으로 다음 사이클 진행
+                retry_count = 0
+                last_retry_reason = None
+            # else: continue / reevaluate / retry / 첫 진입 → 자동으로 다음 사이클 진행
 
             # 3) 한 사이클 실행 (송신 → 모터까지 블로킹)
             success, result, command_dirty = run_one_cycle(
@@ -361,6 +367,31 @@ def main():
             # 4) next_hint 갱신 → 루프 위에서 분기 결정
             execution = result.get('execution') or {}
             last_hint = execution.get('next_action_hint')
+            retry_reason = execution.get('next_action_reason')
+
+            # 5) retry 카운터 관리
+            if last_hint == 'retry':
+                retry_count += 1
+                last_retry_reason = retry_reason
+                print(f"   🔁 retry {retry_count}/{MAX_RETRY} (reason: {retry_reason})")
+
+                if retry_count >= MAX_RETRY:
+                    # 케이스별 분기
+                    if retry_reason == 'target_depth_unavailable':
+                        print(f"\n🎯 타겟에 너무 가까움 → proximity 로직 진입 예정")
+                        last_hint = 'proximity'
+                    else:
+                        print(f"\n⚠️  {MAX_RETRY}회 연속 retry 실패 ({retry_reason}) → 사용자 대기")
+                        last_hint = 'wait_user'
+                    retry_count = 0
+                    last_retry_reason = None
+                else:
+                    # 아직 retry 가능 → 다음 사이클 자동 진행
+                    last_hint = None
+            else:
+                # 정상 사이클이면 카운터 리셋
+                retry_count = 0
+                last_retry_reason = None
 
     except KeyboardInterrupt:
         print('\n중단됨')
