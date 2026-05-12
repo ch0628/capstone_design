@@ -145,10 +145,10 @@ class VisionPlanner:
 Your goal is to solve the user's problem by identifying the most appropriate object in the scene.
 
 STEP-BY-STEP REASONING:
-1. Analyze the user's command to identify their current state.
-2. Determine the physical property or function needed to improve that state.
-3. Evaluate objects in the image from the ALLOWED CLASSES to find the best match.
-4. Identify ALL other objects from the ALLOWED CLASSES that appear in the image.
+1. Analyze the user's command to identify their current state (e.g., hot, tired, thirsty, bored).
+2. Determine the physical property or function needed to improve that state (e.g., cooling, comfort, hydration, entertainment).
+3. Evaluate objects in the image from the ALLOWED CLASSES to find the best match for that property.
+4. Identify ALL other visible objects from the ALLOWED CLASSES as potential obstacles.
 
 ALLOWED CLASSES (use these only):
 [{pool_str}]
@@ -156,10 +156,30 @@ ALLOWED CLASSES (use these only):
 STRICT RULES:
 - target_object: MUST be clearly visible and the best solution for the user's state. If no solution is visible, set to null.
 - reasoning: A very short one-sentence explanation of why this object was chosen.
-- obstacle_classes: List EVERY OTHER object from the ALLOWED CLASSES that you can see in the image (besides the target). Do NOT include the target itself. Be thorough - if you see ANY object from the list, include it. The downstream system will filter which ones actually block the path.
+- obstacle_classes: List EVERY other object from ALLOWED CLASSES visible in the image (excluding target).
+  Be thorough - the downstream system filters which ones actually block the path.
+  Empty list ONLY if literally no other allowed class is visible.
 
 Output format (ONE JSON object only):
 {{"intent": "<verb>", "state_analysis": "<user's state>", "reasoning": "<short explanation>", "target_object": "<class or null>", "obstacle_classes": ["<class>", ...]}}
+
+Examples:
+
+User: "My legs hurt, I need to rest"
+Scene shows: chair, potted plant in path
+-> {{"intent": "rest", "state_analysis": "tired legs", "reasoning": "User needs to sit down, chair is ideal.", "target_object": "chair", "obstacle_classes": ["potted plant"]}}
+
+User: "Pass me something to read"
+Scene shows: book on couch, cup nearby
+-> {{"intent": "read", "state_analysis": "wants entertainment", "reasoning": "Book provides reading material.", "target_object": "book", "obstacle_classes": ["couch", "cup"]}}
+
+User: "I want to change the channel"
+Scene shows: only remote visible
+-> {{"intent": "control_tv", "state_analysis": "wants TV control", "reasoning": "Remote controls the TV.", "target_object": "remote", "obstacle_classes": []}}
+
+User: "Help me find my phone"
+Scene shows: no phone visible
+-> {{"intent": "locate_phone", "state_analysis": "needs phone", "reasoning": "No phone visible in scene.", "target_object": null, "obstacle_classes": []}}
 """
 
     def parse_vlm_plan(self, raw_text):
