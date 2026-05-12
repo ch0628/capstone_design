@@ -12,6 +12,8 @@ System 2가 보낸 action_command를 받아서:
   - "avoid_obstacle"  : bbox 기반 회피 각도 계산 후 회전+전진
   - "stop_at_target"  : 모든 모터 정지
   - "wait_user"       : 사용자 메시지 출력하고 대기
+  - "retry"           : 모터 동작 없이 sender에게 reason 전달 (재시도 유도)
+  - "abort"           : 시스템 에러 → STOP
 
 핵심 인터페이스:
     executor.execute(action_command)
@@ -35,7 +37,7 @@ class MotionExecutor:
         self.avoid_safety_margin_deg = 10.0   # 장애물 가장자리 너머 마진
         self.avoid_turn_min_deg = 10.0        # 회피 각도 하한
         self.avoid_turn_max_deg = 30.0        # 회피 각도 상한
-        self.avoid_forward_m = 0.5            # 회피 시 전진 거리
+        self.avoid_pass_buffer_m = 0.1        # 장애물 너머 여유 마진 (장애물 깊이 + 모터 오차 보정)
 
         # 한 사이클당 최대 이동/회전 (안전: 짧게 끊어서 카메라 재확인)
         self.max_forward_per_cycle_m = 0.4    # 한 번에 최대 40cm
@@ -116,6 +118,7 @@ class MotionExecutor:
         회피 실행.
         - 가장 위험한 장애물 선택 (target과 yaw 차이 최소)
         - bbox 폭으로 회피 각도 계산 (마진 + 클램핑)
+        - 전진 거리는 장애물 depth 기반 동적 계산 (max 한도 내에서)
         - 회전 → 전진 순서로 한 사이클에 둘 다 실행
         """
         target = context["target"]
@@ -149,14 +152,26 @@ class MotionExecutor:
             min(self.avoid_turn_max_deg, raw_turn),
         )
 
+        # 장애물 거리 기반 동적 전진 거리
+        obstacle_distance = most_blocking.get("distance")
+        if obstacle_distance is not None and obstacle_distance > 0:
+            # 장애물 거리 + 지나치는 여유 마진, max 한도 내에서
+            raw_forward = obstacle_distance + self.avoid_pass_buffer_m
+            avoid_forward = min(raw_forward, self.max_forward_per_cycle_m)
+            forward_info = f"obstacle={obstacle_distance:.2f}m → forward={avoid_forward:.2f}m"
+        else:
+            # depth 측정 실패 시 fallback (최대치)
+            avoid_forward = self.max_forward_per_cycle_m
+            forward_info = f"obstacle depth 없음 → fallback {avoid_forward:.2f}m"
+
         print(
             f"   ↪ 회피 대상: {most_blocking['class']} "
-            f"(raw={raw_turn:.2f}°, clamped={clamped_turn:.2f}°)"
+            f"(turn raw={raw_turn:.2f}°, clamped={clamped_turn:.2f}°, {forward_info})"
         )
 
-        # 회전 → 전진 순차 실행 (한 사이클에)
+        # 회전 → 전진 순차 실행
         executed.append(self._motor_turn(avoid_dir, clamped_turn))
-        executed.append(self._motor_move("front", self.avoid_forward_m))
+        executed.append(self._motor_move("front", avoid_forward))
 
         return executed, "reevaluate"
 
@@ -168,7 +183,7 @@ class MotionExecutor:
 
     def _execute_wait_user(self, context):
         executed = [self._motor_stop()]
-        blocking = context["blocking_obstacles"]
+        blocking = context.get("blocking_obstacles", [])
         if blocking:
             classes = list({o["class"] for o in blocking})
             msg = f"길에 {', '.join(classes)}이(가) 계속 막고 있어요. 치워주세요."
@@ -186,8 +201,9 @@ class MotionExecutor:
         Returns:
             dict: {
                 "executed_motions": list[str],
-                "next_action_hint": "continue" | "reevaluate" | "done" | "wait_user" | "abort",
-                "next_avoidance_attempts": int,  # 다음 사이클에 넘길 카운트
+                "next_action_hint": "continue" | "reevaluate" | "done" | "wait_user" | "abort" | "retry",
+                "next_action_reason": str (retry 시),
+                "next_avoidance_attempts": int,
             }
         """
         action = action_command.get("action")
@@ -201,6 +217,17 @@ class MotionExecutor:
             return {
                 "executed_motions": ["STOP"],
                 "next_action_hint": "abort",
+                "next_avoidance_attempts": 0,
+            }
+
+        # retry: 모터 동작 없이 sender에게 reason 전달
+        if action == "retry":
+            reason = action_command.get("reason", "unknown")
+            print(f"   🔁 [retry] reason={reason}")
+            return {
+                "executed_motions": [],
+                "next_action_hint": "retry",
+                "next_action_reason": reason,
                 "next_avoidance_attempts": 0,
             }
 
