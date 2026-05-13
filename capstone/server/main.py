@@ -215,7 +215,8 @@ def handle_one_request(conn, planner, executor, cmd_state):
     # 1-1. 명령 갱신 (RPi가 새 명령 동봉했을 때만)
     if cmd_str is not None:
         cmd_state.update(cmd_str)
-        print(f"📝 [명령 갱신] '{cmd_str}'")
+        planner.reset_state() # 새 작업 시작 시 상태 초기화
+        print(f"📝 [명령 갱신] '{cmd_str}' (상태 초기화)")
 
     # 1-2. 명령 보장 - 한 번도 명령 받은 적 없으면 에러 응답
     if not cmd_state.is_set():

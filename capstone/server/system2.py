@@ -10,7 +10,6 @@ System 2 — VisionPlanner
   - "avoid_obstacle"  : 회피 동작 필요
   - "stop_at_target"  : 목표 거리 도달, 정지
   - "wait_user"       : 사용자 개입 대기 (회피 한도 초과 등)
-  - "emergency_stop"  : 긴급 제동 (충돌 위험)
   - "retry"           : 일시적 실패, 다음 프레임에서 재시도
   - "abort"           : 시스템 에러 (예외 발생)
 
@@ -65,25 +64,34 @@ class VisionPlanner:
         print("🚀 [System2 2/2] YOLOv11 엔진 로딩 중...")
         self.yolo = YOLO("yolo11n.pt")
 
-        # 카메라 파라미터
+        # 카메라 파라미터 (HF70)
         self.hfov_deg = 70.0
 
-        # 정렬/거리 허용 오차
+        # 시스템 설정
+        self.target_distance_m = 0.1  # 목표 거리 10cm
+
+        # 제어 파라미터
         self.center_tolerance_px = 40
-        self.distance_tolerance_m = 0.10
+        self.distance_tolerance_m = 0.05 
+        self.blind_threshold_m = 0.35 
 
         # 장애물 판정 기준
         self.obstacle_angle_corridor_deg = 15.0
         self.obstacle_min_area_ratio = 0.01
-
-        # 회피 한도
         self.max_avoidance_attempts = 3
 
-        # 시스템 설정
-        self.target_distance_m = 0.3
-        self.emergency_brake_distance_m = 0.3
+        # 상태 기억
+        self.last_valid_target_distance = None
+        self.last_plan = None
 
         print("✅ System2(VisionPlanner) 준비 완료")
+
+    def reset_state(self):
+        """새 명령 시작 시 이전 상태 초기화"""
+        self.last_valid_target_distance = None
+        self.last_plan = None
+        print("🧹 [System2] 상태 초기화 완료")
+
 
     # ── VLM ────────────────────────────────────────────────────
 
@@ -112,32 +120,6 @@ class VisionPlanner:
         return self.processor.decode(
             outputs[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True,
         )
-
-    def check_emergency_brake(self, depth_map):
-        """
-        로봇 바로 앞(이미지 하단 중앙)에 충돌 위험이 있는 장애물이 있는지 체크.
-        """
-        if depth_map is None:
-            return False, 0.0
-
-        h, w = depth_map.shape[:2]
-        # 위험 구역 : 하단 70%~95% 영역, 좌우 중앙 30% 영역
-        y1, y2 = int(h * 0.7), int(h * 0.95)
-        x1, x2 = int(w * 0.35), int(w * 0.65)
-
-        roi = depth_map[y1:y2, x1:x2]
-        valid = roi[roi > 0]
-
-        if valid.size == 0:
-            return False, 0.0
-
-        min_dist_mm = np.min(valid)
-        min_dist_m = float(min_dist_mm) / 1000.0
-
-        if min_dist_m < self.emergency_brake_distance_m:
-            return True, min_dist_m
-
-        return False, min_dist_m
 
     def build_planning_prompt(self):
         pool_str = ", ".join(OBJECT_POOL)
@@ -283,8 +265,7 @@ Scene shows: no phone visible
 
     # ── 행동 결정 ──────────────────────────────────────────────
 
-    def select_action(self, target_info, blocking_obstacles, avoidance_attempts, is_emergency=False):
-        if is_emergency: return "emergency_stop"
+    def select_action(self, target_info, blocking_obstacles, avoidance_attempts):
         if blocking_obstacles and avoidance_attempts >= self.max_avoidance_attempts: return "wait_user"
         if blocking_obstacles: return "avoid_obstacle"
         if target_info["aligned"]:
@@ -301,14 +282,24 @@ Scene shows: no phone visible
             pil_img = image if not isinstance(image, str) else Image.open(image).convert("RGB")
             img_w, img_h = pil_img.size
             
-            # 1. 긴급 제동 체크
-            is_emergency, min_dist = self.check_emergency_brake(depth_map)
-            
-            # 2. VLM
-            t_vlm = time.time()
-            res_vlm = self.ask_vlm(pil_img, self.build_planning_prompt(), command)
-            plan = self.parse_vlm_plan(res_vlm)
-            timings["vlm_ms"] = round((time.time() - t_vlm) * 1000, 2)
+            # 2. VLM (블라인드 예상 시 생략)
+            can_skip_vlm = (
+                self.last_plan is not None and 
+                self.last_valid_target_distance is not None and 
+                self.last_valid_target_distance < self.blind_threshold_m
+            )
+
+            if can_skip_vlm:
+                plan = self.last_plan
+                timings["vlm_ms"] = 0.0
+                print(f"   🎯 [Blind Skip] 근접 상황으로 VLM 생략 (Target: {plan['target_object']})")
+            else:
+                t_vlm = time.time()
+                res_vlm = self.ask_vlm(pil_img, self.build_planning_prompt(), command)
+                plan = self.parse_vlm_plan(res_vlm)
+                timings["vlm_ms"] = round((time.time() - t_vlm) * 1000, 2)
+                if plan and plan["target_object"]:
+                    self.last_plan = plan # 성공한 플랜 저장
 
             if plan is None or not plan["target_object"]:
                 return {
@@ -341,51 +332,77 @@ Scene shows: no phone visible
                     "timings": timings,
                 }
 
-            # 4. Post-processing
+            # 4. Post-processing (Depth & Geometry)
             t_post = time.time()
             target_distance = self._read_depth_at_bbox(depth_map, target_det["bbox"])
-            if target_distance is None:
-                return {
-                    "status": "retry",
-                    "action": "retry",
-                    "reason": "target_depth_unavailable",
-                    "timings": timings,
-                }
+            
+            # [Blind Approach 로직]
+            is_blind = False
+            if target_distance is not None:
+                self.last_valid_target_distance = target_distance
+            else:
+                # 거리가 안 읽히는데, 마지막 거리가 35cm 이하였다면 근접 상황으로 간주
+                if self.last_valid_target_distance and self.last_valid_target_distance < self.blind_threshold_m:
+                    is_blind = True
+                    target_distance = self.last_valid_target_distance # 마지막 값으로 대체
+                    print(f"   🎯 [Blind Approach] 센서 사각지대 진입. 마지막 유효 거리({target_distance:.2f}m) 기반 전진")
+                    
+                    # [중요] 다음 사이클에서 또 전진하지 않도록 예측치로 업데이트
+                    # 실제 이동은 system1이 하겠지만, 여기서는 목표치에 도달했다고 가정하고 미리 업데이트함
+                    self.last_valid_target_distance = self.target_distance_m
+                else:
+                    return {
+                        "status": "retry",
+                        "action": "retry",
+                        "reason": "target_depth_unavailable",
+                        "timings": timings,
+                    }
 
             target_geom = self.compute_geometry(target_det["bbox"], img_w, img_h)
             blocking_obstacles = []
-            for od in obstacle_dets:
-                og = self.compute_geometry(od["bbox"], img_w, img_h)
-                odist = self._read_depth_at_bbox(depth_map, od["bbox"]) or (target_distance - 0.01)
-                blocking, reason = self.is_blocking_obstacle(og, odist, target_geom, target_distance)
-                
-                # ★ 진단: 장애물 필터링 상세
-                print(f"   🔍 [obstacle filter] {od['class']} "
-                      f"conf={od['conf']:.2f} "
-                      f"dist={odist:.2f}m yaw={og['yaw_deg']:+.1f}° "
-                      f"area={og['area_ratio']:.3f} "
-                      f"→ {'BLOCKING' if blocking else f'skip({reason})'}")
-                
-                if blocking:
-                    # system1이 회피 거리/방향 계산 시 사용하도록 yaw, distance 추가
-                    od_with_info = {
-                        **od,
-                        "yaw_deg": og["yaw_deg"],
-                        "distance": odist,
-                    }
-                    blocking_obstacles.append(od_with_info)
+            
+            # 장애물 체크 (블라인드 주행 중에는 장애물 체크 생략)
+            if not is_blind:
+                for od in obstacle_dets:
+                    og = self.compute_geometry(od["bbox"], img_w, img_h)
+                    odist = self._read_depth_at_bbox(depth_map, od["bbox"]) or (target_distance - 0.01)
+                    blocking, reason = self.is_blocking_obstacle(og, odist, target_geom, target_distance)
+                    
+                    if blocking:
+                        od_with_info = {**od, "yaw_deg": og["yaw_deg"], "distance": odist}
+                        blocking_obstacles.append(od_with_info)
 
-            target_info = {"class": target_det["class"], "aligned": target_geom["aligned"], "distance": target_distance}
-            action = self.select_action(target_info, blocking_obstacles, avoidance_attempts, is_emergency)
+            target_info = {
+                "class": target_det["class"], 
+                "aligned": target_geom["aligned"], 
+                "distance": target_distance,
+                "is_blind": is_blind
+            }
+            action = self.select_action(target_info, blocking_obstacles, avoidance_attempts)
+
+            # 블라인드 상태에서 목표 도달 판정 강화
+            if is_blind:
+                # 마지막 거리에서 이미 목표(10cm)에 도달했거나 더 가까우면 정지
+                if target_distance <= self.target_distance_m + 0.05:
+                    action = "stop_at_target"
 
             context = {
-                "target": {"class": target_det["class"], "bbox": target_det["bbox"], "yaw_deg": target_geom["yaw_deg"], "aligned": target_geom["aligned"], "distance": target_distance, "distance_error": target_distance - self.target_distance_m},
+                "target": {
+                    "class": target_det["class"], 
+                    "bbox": target_det["bbox"], 
+                    "yaw_deg": target_geom["yaw_deg"], 
+                    "aligned": target_geom["aligned"], 
+                    "distance": target_distance, 
+                    "distance_error": target_distance - self.target_distance_m,
+                    "is_blind": is_blind
+                },
                 "blocking_obstacles": blocking_obstacles,
                 "image": {"width": img_w, "height": img_h, "hfov_deg": self.hfov_deg},
                 "config": {"target_distance_m": self.target_distance_m, "distance_tolerance_m": self.distance_tolerance_m, "center_tolerance_px": self.center_tolerance_px},
                 "avoidance_attempts": avoidance_attempts,
             }
 
+            timings["post_ms"] = round((time.time() - t_post) * 1000, 2)
             timings["total_ms"] = round((time.time() - t_total_start) * 1000, 2)
             return {"status": "success", "action": action, "context": context, "plan": plan, "timings": timings}
 

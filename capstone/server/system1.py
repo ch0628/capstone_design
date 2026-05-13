@@ -82,7 +82,11 @@ class MotionExecutor:
         """
         target = context["target"]
         config = context["config"]
+        is_blind = target.get("is_blind", False)
         executed = []
+
+        if is_blind:
+            print("   🎯 [Blind Move] 센서 데이터 없이 관성 주행 중...")
 
         # 정렬 우선
         if not target["aligned"]:
