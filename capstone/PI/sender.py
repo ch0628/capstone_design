@@ -86,7 +86,6 @@ class ImageSender(Node):
             )
 
     def wait_for_first_frame(self, timeout_s=INITIAL_FRAME_TIMEOUT_S):
-        """첫 프레임 들어올 때까지 대기. 타임아웃 시 False."""
         start = time.time()
         while time.time() - start < timeout_s:
             if self.get_latest_frame() is not None:
@@ -109,7 +108,6 @@ def recv_all(sock, count):
 def send_one_shot(color_img, depth_img, command_to_send):
     """
     매 호출마다 새 소켓 연결 → 송신 → 응답 수신 → 닫기.
-    command_to_send: str | None
     """
     t_pi_start = time.time()
 
@@ -210,7 +208,6 @@ def print_stats(res, t_start, t_end):
 
 
 def prompt_initial_command():
-    """프로그램 시작 시 명령 강제 입력. 빈 입력이나 q면 None."""
     print('\n[SERAPH RPi Sender]')
     print('  로봇에게 시킬 일을 자연어로 입력하세요.')
     print('  예시: "목 마르네", "리모컨 가져와", "책 좀"')
@@ -222,14 +219,6 @@ def prompt_initial_command():
 
 
 def prompt_after_task_end(current_command, hint):
-    """
-    task 종료(done/wait_user/abort/proximity) 시 사용자 입력 분기.
-
-    Returns:
-        ('continue', None)        : 같은 명령 재시도
-        ('new_command', new_cmd)  : 새 명령으로 교체
-        ('quit', None)            : 종료
-    """
     if hint == 'done':
         print('\n✅ 도착 완료. 다음에 뭘 할까요?')
     elif hint == 'wait_user':
@@ -252,15 +241,6 @@ def prompt_after_task_end(current_command, hint):
 
 
 def run_one_cycle(node, motor, current_command, command_dirty):
-    """
-    한 사이클 실행: 프레임 송신 → 응답 수신 → 모터 실행.
-
-    Returns:
-        (success, result_dict, new_command_dirty)
-        success: True if 사이클 정상 완료, False if 송수신 실패
-        result_dict: 서버 응답 (실패 시 None)
-        new_command_dirty: 다음 사이클에 명령 재전송 필요 여부
-    """
     snapshot = node.get_latest_frame()
     if snapshot is None:
         print('⚠ 카메라 프레임이 아직 없음. 0.2초 후 재시도.')
@@ -272,27 +252,23 @@ def run_one_cycle(node, motor, current_command, command_dirty):
     cmd_indicator = "+ 명령" if command_dirty else "(명령 생략)"
     print(f'\n→ 프레임 #{count} 송신 중 {cmd_indicator}...')
 
-    # 송신
     try:
         result, t_start, t_end = send_one_shot(color_img, depth_img, cmd_to_send)
     except Exception as e:
         node.get_logger().error(f'송신/수신 실패: {e}')
-        return False, None, command_dirty   # dirty 유지 → 다음 시도에 명령 재전송
+        return False, None, command_dirty
 
-    # 송신 성공 → 서버가 명령을 알고 있음
     new_dirty = False
 
     print_stats(result, t_start, t_end)
 
-    # 에러 응답 처리
     if result.get('status') == 'error':
         reason = result.get('reason', 'unknown')
         print(f'⚠ 서버 에러: {reason}')
         if reason == 'no_command_set':
-            new_dirty = True   # 서버가 명령을 잃어버림 → 재전송
+            new_dirty = True
         return True, result, new_dirty
 
-    # 모터 실행 (블로킹)
     execution = result.get('execution') or {}
     motions = execution.get('executed_motions', [])
     if motions:
@@ -307,14 +283,11 @@ def main():
     rclpy.init()
     node = ImageSender()
 
-    # 백그라운드 spin
     spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()
 
-    # 모터 초기화
     motor = MotorDriver()
 
-    # 1) 명령 입력
     current_command = prompt_initial_command()
     if current_command is None:
         print('명령 없이 종료합니다.')
@@ -323,7 +296,6 @@ def main():
         rclpy.shutdown()
         return
 
-    # 첫 프레임 대기
     print('\n📷 첫 카메라 프레임 대기 중...')
     if not node.wait_for_first_frame():
         print('❌ 카메라 프레임이 안 들어옵니다. RealSense 노드 확인 필요.')
@@ -340,43 +312,34 @@ def main():
 
     try:
         while True:
-            # 2) 직전 hint에 따라 분기
             if last_hint in TASK_END_HINTS:
-                # task 종료 → 사용자 입력 받기
                 action, new_cmd = prompt_after_task_end(current_command, last_hint)
                 if action == 'quit':
                     break
                 if action == 'new_command':
                     current_command = new_cmd
                     command_dirty = True
-                # 'continue'면 그대로 진행
-                last_hint = None   # 새 사이클 시작
+                last_hint = None
                 retry_count = 0
                 last_retry_reason = None
-            # else: continue / reevaluate / retry / 첫 진입 → 자동으로 다음 사이클 진행
 
-            # 3) 한 사이클 실행 (송신 → 모터까지 블로킹)
             success, result, command_dirty = run_one_cycle(
                 node, motor, current_command, command_dirty
             )
 
             if not success:
-                # 송수신 실패 → 잠시 후 재시도
                 continue
 
-            # 4) next_hint 갱신 → 루프 위에서 분기 결정
             execution = result.get('execution') or {}
             last_hint = execution.get('next_action_hint')
             retry_reason = execution.get('next_action_reason')
 
-            # 5) retry 카운터 관리
             if last_hint == 'retry':
                 retry_count += 1
                 last_retry_reason = retry_reason
                 print(f"   🔁 retry {retry_count}/{MAX_RETRY} (reason: {retry_reason})")
 
                 if retry_count >= MAX_RETRY:
-                    # 케이스별 분기
                     if retry_reason == 'target_depth_unavailable':
                         print(f"\n🎯 타겟에 너무 가까움 → proximity 로직 진입 예정")
                         last_hint = 'proximity'
@@ -386,10 +349,8 @@ def main():
                     retry_count = 0
                     last_retry_reason = None
                 else:
-                    # 아직 retry 가능 → 다음 사이클 자동 진행
                     last_hint = None
             else:
-                # 정상 사이클이면 카운터 리셋
                 retry_count = 0
                 last_retry_reason = None
 
