@@ -27,19 +27,18 @@ from adafruit_character_lcd.character_lcd_i2c import Character_LCD_I2C
 
 
 # ── 속도 설정 (실측 캘리브레이션) ──────────────────────────
-BASE_SPEED = 0x6000        # 기준 속도 (PWM duty cycle, 약 37.5%)
+BASE_SPEED = 0xC000        # 또는 사용 중인 새 값
 
-# 직진 trim — 왼쪽 모터가 강해서 살짝 줄임 (휨 보정)
-LEFT_TRIM = 0.88
+# 직진 trim
+LEFT_TRIM = 0.869          # ★ 0.88 → 0.869
 RIGHT_TRIM = 1.00
 
-LEFT_SPEED = int(BASE_SPEED * LEFT_TRIM)    # 직진/후진 시 왼쪽
-RIGHT_SPEED = int(BASE_SPEED * RIGHT_TRIM)  # 직진/후진 시 오른쪽
-# 회전 시에는 양쪽 BASE_SPEED 풀로 사용 (회전력 확보)
+LEFT_SPEED = int(BASE_SPEED * LEFT_TRIM)
+RIGHT_SPEED = int(BASE_SPEED * RIGHT_TRIM)
 
 # 시간 환산 상수 (실측)
-LINEAR_SPEED_MPS = 0.285   # 직진 속도 (LEFT_TRIM=0.88 기준)
-ANGULAR_SPEED_DPS = 45.0   # 회전 속도 (양쪽 BASE_SPEED 기준)
+LINEAR_SPEED_MPS = 0.400   # ★ 0.285 → 0.400
+ANGULAR_SPEED_DPS = 135.0  # ★ 45.0 → 135.0
 
 # 모터 동작 후 settle delay (관성 잦아들기 위해 대기)
 SETTLE_DELAY_S = 0.15
