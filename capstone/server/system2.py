@@ -80,18 +80,95 @@ class VisionPlanner:
         self.obstacle_min_area_ratio = 0.01
         self.max_avoidance_attempts = 3
 
-        # 상태 기억
-        self.last_valid_target_distance = None
+        # [Optimized] 스마트 캐싱 및 상태 관리
+        self.memory = {} # { "class_name": {"dist": 1.2, "yaw": 15.0, "time": 123456} }
+        self.memory_expiry_s = 30.0
         self.last_plan = None
+        self.last_valid_target_distance = None
 
-        print("✅ System2(VisionPlanner) 준비 완료")
+        # VLM 캐싱 제어
+        self.vlm_refresh_interval = 10 # 10프레임마다 강제 갱신
+        self.frame_counter = 0
+        self.target_lost_count = 0
+        self.max_target_lost_limit = 3 # 3번 이상 타겟 놓치면 VLM 다시 부름
+
+        # 검색 상태 (360도 탐색)
+        self.is_searching = False
+        self.search_total_angle = 0.0
+        self.search_angle_step = 60.0
+
+        print("✅ System2(VisionPlanner) 준비 완료 (Smart Caching 활성화)")
 
     def reset_state(self):
         """새 명령 시작 시 이전 상태 초기화"""
         self.last_valid_target_distance = None
         self.last_plan = None
+        self.memory = {}
+        self.is_searching = False
+        self.search_total_angle = 0.0
+        self.frame_counter = 0
+        self.target_lost_count = 0
         print("🧹 [System2] 상태 초기화 완료")
 
+    # ── 단기 기억 관리 ──────────────────────────────────────────
+
+    def update_memory(self, label, distance, yaw, width_deg=None):
+        self.memory[label] = {
+            "dist": distance, 
+            "yaw": yaw, 
+            "width_deg": width_deg, # [추가] 장애물 폭(각도) 정보
+            "time": time.time()
+        }
+
+    def get_from_memory(self, label):
+        if label not in self.memory: return None
+        item = self.memory[label]
+        if time.time() - item["time"] > self.memory_expiry_s:
+            del self.memory[label]
+            return None
+        return item
+
+    def update_memory_on_motion(self, motions):
+        """로봇 이동에 따른 메모리 좌표 보정"""
+        for m in motions:
+            turn_match = re.match(r"TURN (LEFT|RIGHT) ([\d.]+)deg", m)
+            if turn_match:
+                direction, angle = turn_match.group(1).upper(), float(turn_match.group(2))
+                diff = -angle if direction == "LEFT" else angle
+                for label in self.memory: self.memory[label]["yaw"] += diff
+                # 큰 회전 발생 시 다음 프레임에서 VLM 갱신 유도 위해 카운터 조절
+                if angle > 45: self.frame_counter = self.vlm_refresh_interval
+                continue
+
+            move_match = re.match(r"MOVE (FRONT|BACK) ([\d.]+)m", m)
+            if move_match:
+                direction, dist = move_match.group(1).upper(), float(move_match.group(2))
+                sign = 1 if direction == "FRONT" else -1
+                new_memory = {}
+                for label, item in self.memory.items():
+                    yaw_rad = math.radians(item["yaw"])
+                    x = item["dist"] * math.cos(yaw_rad) - (dist * sign)
+                    y = -item["dist"] * math.sin(yaw_rad)
+                    new_dist = math.sqrt(x**2 + y**2)
+                    new_yaw = math.degrees(math.atan2(-y, x))
+                    
+                    # [보정] 거리가 가까워지면 시야에서 차지하는 각도(width_deg)는 커짐
+                    # 물리적 크기(W) = dist * sin(width_deg)
+                    # 새로운 width_deg = arcsin(W / new_dist)
+                    new_width_deg = item.get("width_deg")
+                    if new_width_deg and new_dist > 0:
+                        physical_size = item["dist"] * math.sin(math.radians(new_width_deg / 2))
+                        # 안전을 위해 arcsin 값이 1을 넘지 않도록 클램핑
+                        ratio = min(1.0, physical_size / new_dist)
+                        new_width_deg = math.degrees(math.asin(ratio)) * 2
+
+                    new_memory[label] = {
+                        "dist": new_dist, 
+                        "yaw": new_yaw, 
+                        "width_deg": new_width_deg,
+                        "time": item["time"]
+                    }
+                self.memory = new_memory
 
     # ── VLM ────────────────────────────────────────────────────
 
@@ -244,23 +321,44 @@ Scene shows: no phone visible
         yaw_deg = math.degrees(yaw_rad)
         return yaw_deg, pixel_offset, False
 
-    def _read_depth_at_bbox(self, depth_map, bbox):
+    def _read_depth_at_bbox(self, depth_map, bbox, label=None):
+        """
+        BBox 내의 Depth를 읽되, ROI 축소와 시간적 필터링(EMA)을 적용.
+        """
         if depth_map is None: return None
         x1, y1, x2, y2 = [int(v) for v in bbox]
-        h, w = depth_map.shape[:2]
-        x1, x2 = max(0, min(x1, w - 1)), max(0, min(x2, w))
-        y1, y2 = max(0, min(y1, h - 1)), max(0, min(y2, h))
-        if x2 <= x1 or y2 <= y1: return None
-        roi = depth_map[y1:y2, x1:x2]
+        
+        # 1. ROI 축소 (중앙부 50% 영역만 사용하여 배경 노이즈 제거)
+        w_px, h_px = x2 - x1, y2 - y1
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        nx1, nx2 = max(0, cx - w_px // 4), min(cx + w_px // 4, depth_map.shape[1])
+        ny1, ny2 = max(0, cy - h_px // 4), min(cy + h_px // 4, depth_map.shape[0])
+        
+        if nx2 <= nx1 or ny2 <= ny1: return None
+        roi = depth_map[ny1:ny2, nx1:nx2]
         valid = roi[roi > 0]
         if valid.size == 0: return None
-        return float(np.median(valid)) / 1000.0
+        
+        current_dist = float(np.median(valid)) / 1000.0
+        
+        # 2. 시간적 필터링 (STM 활용)
+        if label:
+            prev_item = self.get_from_memory(label)
+            if prev_item:
+                # 급격한 변화(예: 1.5m 이상 갑자기 튐) 시 이전 값 중시하여 노이즈 제거
+                if abs(current_dist - prev_item["dist"]) > 1.5:
+                    return prev_item["dist"]
+                # 지수 가중 이동 평균 (EMA): 현재 70%, 과거 30%
+                current_dist = 0.7 * current_dist + 0.3 * prev_item["dist"]
+            
+        return current_dist
 
     def is_blocking_obstacle(self, obs_geom, obs_distance, target_geom, target_distance):
-        if obs_distance >= target_distance: return False, "behind_target"
+        if obs_distance >= target_distance + 0.1: return False, "behind_target"
         angle_diff = abs(obs_geom["yaw_deg"] - target_geom["yaw_deg"])
+        # 장애물이 경로(타겟 방향) 주변 15도 내에 있는지 확인
         if angle_diff > self.obstacle_angle_corridor_deg: return False, "out_of_corridor"
-        if obs_geom["area_ratio"] < self.obstacle_min_area_ratio: return False, "too_small"
+        if obs_geom.get("area_ratio", 1.0) < self.obstacle_min_area_ratio: return False, "too_small"
         return True, "blocking"
 
     # ── 행동 결정 ──────────────────────────────────────────────
@@ -270,141 +368,151 @@ Scene shows: no phone visible
         if blocking_obstacles: return "avoid_obstacle"
         if target_info["aligned"]:
             distance_error = target_info["distance"] - self.target_distance_m
-            if abs(distance_error) <= self.distance_tolerance_m: return "stop_at_target"
+            # 목표 거리에 도달했거나 근접했으면 정지
+            if distance_error <= self.distance_tolerance_m: return "stop_at_target"
         return "track"
 
     # ── 메인 진입점 ────────────────────────────────────────────
 
     def plan(self, image, command, depth_map, avoidance_attempts=0):
         t_total_start = time.time()
-        timings = {}
+        timings = {"vlm_ms": 0.0, "yolo_ms": 0.0, "post_ms": 0.0}
+        self.frame_counter += 1
+        
         try:
             pil_img = image if not isinstance(image, str) else Image.open(image).convert("RGB")
             img_w, img_h = pil_img.size
             
-            # 2. VLM (블라인드 예상 시 생략)
-            can_skip_vlm = (
-                self.last_plan is not None and 
+            # ── [1. VLM 스마트 캐싱 결정] ──
+            need_vlm = False
+            # 사유 1: 첫 실행
+            if self.last_plan is None: need_vlm = True
+            # 사유 2: 주기적 갱신
+            elif self.frame_counter >= self.vlm_refresh_interval: need_vlm = True
+            # 사유 3: 타겟을 일정 기간 놓침 (확증 편향 방지)
+            elif self.target_lost_count >= self.max_target_lost_limit: need_vlm = True
+            
+            # 근접 상황(Blind)이면 VLM 강제 생략 (성능 최우선)
+            is_blind_area = (
                 self.last_valid_target_distance is not None and 
                 self.last_valid_target_distance < self.blind_threshold_m
             )
+            if is_blind_area: need_vlm = False
 
-            if can_skip_vlm:
-                plan = self.last_plan
-                timings["vlm_ms"] = 0.0
-                print(f"   🎯 [Blind Skip] 근접 상황으로 VLM 생략 (Target: {plan['target_object']})")
-            else:
+            if need_vlm:
                 t_vlm = time.time()
                 res_vlm = self.ask_vlm(pil_img, self.build_planning_prompt(), command)
                 plan = self.parse_vlm_plan(res_vlm)
                 timings["vlm_ms"] = round((time.time() - t_vlm) * 1000, 2)
                 if plan and plan["target_object"]:
-                    self.last_plan = plan # 성공한 플랜 저장
+                    self.last_plan = plan
+                    self.frame_counter = 0 # 카운터 리셋
+            else:
+                plan = self.last_plan
+                # print(f"   ⚡ [VLM Cached] Frame: {self.frame_counter}/{self.vlm_refresh_interval}")
 
             if plan is None or not plan["target_object"]:
-                return {
-                    "status": "retry",
-                    "action": "retry",
-                    "reason": "no_target",
-                    "timings": timings,
-                }
+                return {"status": "retry", "action": "retry", "reason": "no_target", "timings": timings}
 
-            # 3. YOLO
+            # ── [2. YOLO 검출] ──
             t_yolo = time.time()
             target_det, obstacle_dets = self.detect_objects(pil_img, plan["target_object"], plan["obstacle_classes"])
             timings["yolo_ms"] = round((time.time() - t_yolo) * 1000, 2)
 
-            # ★ 진단: YOLO 검출 결과
-            print(f"   🔍 [YOLO] target_det={'O' if target_det else 'X'}, obstacle_dets={len(obstacle_dets)}건")
-            if target_det:
-                print(f"   🎯 [YOLO target] bbox={[round(v,1) for v in target_det['bbox']]} "
-                      f"conf={target_det['conf']:.3f}")
-            for od in obstacle_dets:
-                print(f"   🚧 [YOLO obstacle] {od['class']} "
-                      f"bbox={[round(v,1) for v in od['bbox']]} "
-                      f"conf={od['conf']:.3f}")
-
+            # ── [3. 타겟 검출 실패 대응] ──
             if target_det is None:
-                return {
-                    "status": "retry",
-                    "action": "retry",
-                    "reason": "target_not_found",
-                    "timings": timings,
-                }
+                self.target_lost_count += 1
+                
+                # 메모리 복구 시도
+                mem_item = self.get_from_memory(plan["target_object"])
+                if mem_item:
+                    print(f"   🧠 [Memory Recovery] '{plan['target_object']}' 추적 중 (Memory)")
+                    target_info = {
+                        "class": plan["target_object"], "aligned": abs(mem_item["yaw"]) <= 5.0,
+                        "distance": mem_item["dist"], "yaw_deg": mem_item["yaw"],
+                        "distance_error": mem_item["dist"] - self.target_distance_m, "is_memory": True
+                    }
+                    action = "stop_at_target" if mem_item["dist"] <= self.target_distance_m + 0.05 and target_info["aligned"] else "track"
+                    return {"status": "success", "action": action, "context": {"target": target_info, "blocking_obstacles": [], "image": {"width": img_w, "height": img_h, "hfov_deg": self.hfov_deg}, "config": {"target_distance_m": self.target_distance_m, "distance_tolerance_m": self.distance_tolerance_m, "center_tolerance_px": self.center_tolerance_px}}, "plan": plan, "timings": timings}
 
-            # 4. Post-processing (Depth & Geometry)
+                # 탐색 모드
+                if not self.is_searching: self.is_searching = True; self.search_total_angle = 0.0
+                if self.search_total_angle < 360.0:
+                    self.search_total_angle += self.search_angle_step
+                    return {"status": "success", "action": "search_rotate", "context": {"action": "search_rotate", "turn_deg": self.search_angle_step, "direction": "right"}, "plan": plan, "timings": timings}
+                else:
+                    self.is_searching = False
+                    return {"status": "retry", "action": "retry", "reason": "target_lost", "timings": timings}
+
+            # 타겟 발견 시 상태 업데이트
+            self.target_lost_count = 0
+            if self.is_searching: self.is_searching = False; self.search_total_angle = 0.0
+
+            # ── [4. 후처리: Depth & Geometry & Memory Obstacles] ──
             t_post = time.time()
-            target_distance = self._read_depth_at_bbox(depth_map, target_det["bbox"])
+            target_distance = self._read_depth_at_bbox(depth_map, target_det["bbox"], target_det["class"])
             
-            # [Blind Approach 로직]
             is_blind = False
             if target_distance is not None:
                 self.last_valid_target_distance = target_distance
+                target_geom = self.compute_geometry(target_det["bbox"], img_w, img_h)
+                self.update_memory(target_det["class"], target_distance, target_geom["yaw_deg"])
             else:
-                # 거리가 안 읽히는데, 마지막 거리가 35cm 이하였다면 근접 상황으로 간주
-                if self.last_valid_target_distance and self.last_valid_target_distance < self.blind_threshold_m:
+                if is_blind_area:
                     is_blind = True
-                    target_distance = self.last_valid_target_distance # 마지막 값으로 대체
-                    print(f"   🎯 [Blind Approach] 센서 사각지대 진입. 마지막 유효 거리({target_distance:.2f}m) 기반 전진")
-                    
-                    # [중요] 다음 사이클에서 또 전진하지 않도록 예측치로 업데이트
-                    # 실제 이동은 system1이 하겠지만, 여기서는 목표치에 도달했다고 가정하고 미리 업데이트함
-                    self.last_valid_target_distance = self.target_distance_m
+                    target_distance = self.last_valid_target_distance
+                    target_geom = {"aligned": True, "yaw_deg": 0.0}
                 else:
-                    return {
-                        "status": "retry",
-                        "action": "retry",
-                        "reason": "target_depth_unavailable",
-                        "timings": timings,
-                    }
+                    return {"status": "retry", "action": "retry", "reason": "depth_lost", "timings": timings}
 
-            target_geom = self.compute_geometry(target_det["bbox"], img_w, img_h)
+            # 장애물 체크 (YOLO + Memory)
             blocking_obstacles = []
-            
-            # 장애물 체크 (블라인드 주행 중에는 장애물 체크 생략)
             if not is_blind:
+                # YOLO 장애물
                 for od in obstacle_dets:
                     og = self.compute_geometry(od["bbox"], img_w, img_h)
-                    odist = self._read_depth_at_bbox(depth_map, od["bbox"]) or (target_distance - 0.01)
-                    blocking, reason = self.is_blocking_obstacle(og, odist, target_geom, target_distance)
                     
-                    if blocking:
-                        od_with_info = {**od, "yaw_deg": og["yaw_deg"], "distance": odist}
-                        blocking_obstacles.append(od_with_info)
+                    # [추가] BBox 폭을 각도로 변환
+                    x1, _, x2, _ = od["bbox"]
+                    fx = (img_w / 2) / math.tan(math.radians(self.hfov_deg) / 2)
+                    width_deg = math.degrees(math.atan(((x2 - x1) / 2) / fx)) * 2
+                    
+                    odist = self._read_depth_at_bbox(depth_map, od["bbox"], od["class"]) or (target_distance - 0.01)
+                    
+                    # 메모리 저장 시 폭 정보 포함
+                    self.update_memory(od["class"], odist, og["yaw_deg"], width_deg)
+                    
+                    if self.is_blocking_obstacle(og, odist, target_geom, target_distance)[0]:
+                        blocking_obstacles.append({**od, "yaw_deg": og["yaw_deg"], "distance": odist, "width_deg": width_deg, "source": "yolo"})
+                
+                # 메모리 장애물 (시야 밖)
+                for label, item in self.memory.items():
+                    if label == target_det["class"] or any(o["class"] == label for o in blocking_obstacles): continue
+                    if self.is_blocking_obstacle({"yaw_deg": item["yaw"], "area_ratio": 0.1}, item["dist"], target_geom, target_distance)[0]:
+                        blocking_obstacles.append({
+                            "class": label, "distance": item["dist"], "yaw_deg": item["yaw"], 
+                            "width_deg": item.get("width_deg"), # 메모리에 저장된 폭 정보 전달
+                            "bbox": [0,0,0,0], "source": "memory"
+                        })
 
-            target_info = {
-                "class": target_det["class"], 
-                "aligned": target_geom["aligned"], 
-                "distance": target_distance,
-                "is_blind": is_blind
-            }
-            action = self.select_action(target_info, blocking_obstacles, avoidance_attempts)
+            action = self.select_action({"class": target_det["class"], "aligned": target_geom["aligned"], "distance": target_distance}, blocking_obstacles, avoidance_attempts)
+            if is_blind and target_distance <= self.target_distance_m + 0.05: action = "stop_at_target"
 
-            # 블라인드 상태에서 목표 도달 판정 강화
-            if is_blind:
-                # 마지막 거리에서 이미 목표(10cm)에 도달했거나 더 가까우면 정지
-                if target_distance <= self.target_distance_m + 0.05:
-                    action = "stop_at_target"
-
+            timings["post_ms"] = round((time.time() - t_post) * 1000, 2)
+            timings["total_ms"] = round((time.time() - t_total_start) * 1000, 2)
+            
             context = {
-                "target": {
-                    "class": target_det["class"], 
-                    "bbox": target_det["bbox"], 
-                    "yaw_deg": target_geom["yaw_deg"], 
-                    "aligned": target_geom["aligned"], 
-                    "distance": target_distance, 
-                    "distance_error": target_distance - self.target_distance_m,
-                    "is_blind": is_blind
-                },
+                "target": {**target_det, "yaw_deg": target_geom["yaw_deg"], "aligned": target_geom["aligned"], "distance": target_distance, "distance_error": target_distance - self.target_distance_m, "is_blind": is_blind},
                 "blocking_obstacles": blocking_obstacles,
                 "image": {"width": img_w, "height": img_h, "hfov_deg": self.hfov_deg},
                 "config": {"target_distance_m": self.target_distance_m, "distance_tolerance_m": self.distance_tolerance_m, "center_tolerance_px": self.center_tolerance_px},
                 "avoidance_attempts": avoidance_attempts,
             }
-
-            timings["post_ms"] = round((time.time() - t_post) * 1000, 2)
-            timings["total_ms"] = round((time.time() - t_total_start) * 1000, 2)
             return {"status": "success", "action": action, "context": context, "plan": plan, "timings": timings}
+
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return {"status": "abort", "action": "abort", "reason": str(e), "timings": {"total_ms": 0}}
 
         except Exception as e:
             return {"status": "abort", "action": "abort", "reason": str(e), "timings": {"total_ms": 0}}

@@ -270,6 +270,12 @@ def handle_one_request(conn, planner, executor, cmd_state):
     execution = executor.execute(action_command)
     t_exec_done = time.time()
 
+    # 4-1. [Memory Update] 실행된 움직임을 메모리에 반영
+    executed_motions = execution.get("executed_motions", [])
+    if executed_motions:
+        planner.update_memory_on_motion(executed_motions)
+        print(f"   🧠 [Memory Update] {len(executed_motions)}개 동작 반영 완료")
+
     # 5. 응답 패키징 (system2의 정밀 timings 활용)
     t_server_sent = time.time()
     s2_timings = action_command.get("timings", {})

@@ -122,8 +122,7 @@ class MotionExecutor:
         회피 실행.
         - 가장 위험한 장애물 선택 (target과 yaw 차이 최소)
         - bbox 폭으로 회피 각도 계산 (마진 + 클램핑)
-        - 전진 거리는 장애물 depth 기반 동적 계산 (max 한도 내에서)
-        - 회전 → 전진 순서로 한 사이클에 둘 다 실행
+        - 만약 메모리 장애물(bbox 없음)이라면 고정된 안전 각도 사용
         """
         target = context["target"]
         blocking = context["blocking_obstacles"]
@@ -144,33 +143,45 @@ class MotionExecutor:
             avoid_dir = "right"
 
         # bbox 기반 회피 각도 계산
-        x1, _, x2, _ = most_blocking["bbox"]
-        half_width_px = (x2 - x1) / 2
-        hfov_rad = math.radians(hfov_deg)
-        fx = (img_w / 2) / math.tan(hfov_rad / 2)
-        half_angle_deg = math.degrees(math.atan(half_width_px / fx))
+        bbox = most_blocking.get("bbox", [0, 0, 0, 0])
+        mem_width_deg = most_blocking.get("width_deg")
 
-        raw_turn = half_angle_deg + self.avoid_safety_margin_deg
-        clamped_turn = max(
-            self.avoid_turn_min_deg,
-            min(self.avoid_turn_max_deg, raw_turn),
-        )
+        if (bbox == [0, 0, 0, 0] or most_blocking.get("source") == "memory") and mem_width_deg:
+            # [메모리 장애물] 저장된 폭 정보(width_deg)를 기반으로 회피 각도 계산
+            raw_turn = (mem_width_deg / 2) + self.avoid_safety_margin_deg
+            clamped_turn = max(self.avoid_turn_min_deg, min(self.avoid_turn_max_deg, raw_turn))
+            print(f"   🧠 [Memory Avoid] 시야 밖 장애물 '{most_blocking['class']}' (width_deg={mem_width_deg:.1f}°) 회피: {clamped_turn:.2f}° 회전")
+        elif bbox != [0, 0, 0, 0]:
+            # [실시간 장애물] bbox 폭으로 정밀 계산
+            x1, _, x2, _ = bbox
+            half_width_px = (x2 - x1) / 2
+            hfov_rad = math.radians(hfov_deg)
+            fx = (img_w / 2) / math.tan(hfov_rad / 2)
+            half_angle_deg = math.degrees(math.atan(half_width_px / fx))
+
+            raw_turn = half_angle_deg + self.avoid_safety_margin_deg
+            clamped_turn = max(
+                self.avoid_turn_min_deg,
+                min(self.avoid_turn_max_deg, raw_turn),
+            )
+        else:
+            # 폭 정보가 아예 없는 경우 fallback
+            clamped_turn = self.avoid_turn_min_deg + self.avoid_safety_margin_deg
+            print(f"   ⚠️ [Fallback Avoid] 폭 정보 없음, 기본 각도 {clamped_turn:.2f}° 적용")
 
         # 장애물 거리 기반 동적 전진 거리
         obstacle_distance = most_blocking.get("distance")
         if obstacle_distance is not None and obstacle_distance > 0:
-            # 장애물 거리 + 지나치는 여유 마진, max 한도 내에서
             raw_forward = obstacle_distance + self.avoid_pass_buffer_m
             avoid_forward = min(raw_forward, self.max_forward_per_cycle_m)
             forward_info = f"obstacle={obstacle_distance:.2f}m → forward={avoid_forward:.2f}m"
         else:
-            # depth 측정 실패 시 fallback (최대치)
             avoid_forward = self.max_forward_per_cycle_m
             forward_info = f"obstacle depth 없음 → fallback {avoid_forward:.2f}m"
 
         print(
             f"   ↪ 회피 대상: {most_blocking['class']} "
-            f"(turn raw={raw_turn:.2f}°, clamped={clamped_turn:.2f}°, {forward_info})"
+            f"(turn={clamped_turn:.2f}°, {forward_info})"
         )
 
         # 회전 → 전진 순차 실행
@@ -184,6 +195,15 @@ class MotionExecutor:
         target = context["target"]
         print(f"   🎯 도착! target={target['class']}, distance={target['distance']:.2f}m")
         return executed, "done"
+
+    def _execute_search_rotate(self, context):
+        """360도 탐색을 위한 회전 동작"""
+        turn_deg = context.get("turn_deg", 60.0)
+        direction = context.get("direction", "right")
+        
+        executed = [self._motor_turn(direction, turn_deg)]
+        print(f"   🔍 [Search] 탐색을 위해 {direction} 방향으로 {turn_deg}도 회전합니다.")
+        return executed, "reevaluate"
 
     def _execute_wait_user(self, context):
         executed = [self._motor_stop()]
@@ -250,6 +270,9 @@ class MotionExecutor:
         elif action == "avoid_obstacle":
             executed, hint = self._execute_avoid_obstacle(context)
             next_attempts = current_attempts + 1
+        elif action == "search_rotate":
+            executed, hint = self._execute_search_rotate(context)
+            next_attempts = 0
         elif action == "stop_at_target":
             executed, hint = self._execute_stop_at_target(context)
             next_attempts = 0
