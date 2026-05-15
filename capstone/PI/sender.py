@@ -1,13 +1,14 @@
 """
-sender.py — RPi 메인 (모터 통합 버전)
+sender.py — RPi 메인 (모터 통합 버전 - 복구 및 개선 통합)
 
 구조:
   프레임 송신 → 응답 수신 → 모터 실행(블로킹) → 자동으로 다음 프레임 송신 → ...
   next_action_hint이 done/wait_user/abort/proximity일 때만 사용자 입력 대기.
   retry hint는 자동으로 다음 사이클 진행, MAX_RETRY 초과 시 케이스별 처리.
 
-서버는 그대로(MotionExecutor mock 유지). 서버가 보낸 executed_motions 문자열을
-RPi의 MotorDriver(PCA9685)가 받아서 실제 모터를 돌린다.
+- RealSense 카메라 노드에서 RGB, Depth를 ApproximateTimeSynchronizer로 받음
+- 서버에 송신하고 응답(Action)을 받아서 motor.py에 전달
+- TCP 9999 포트 사용 (main.py와 짝꿍)
 """
 
 import rclpy
@@ -21,11 +22,13 @@ import socket
 import struct
 import time
 import json
+import numpy as np
 
-from motor import MotorDriver
+from motor import MotorControl
 
 
-SERVER_HOST = 'localhost'
+# ── 시연 설정 ─────────────────────────────────────────────────
+SERVER_HOST = "192.168.0.35"  # GPU 서버 IP (실제 환경에 맞게 수정)
 SERVER_PORT = 9999
 
 # task가 끝났음을 의미하는 hint들 → 사용자 입력 대기
@@ -106,10 +109,10 @@ def recv_all(sock, count):
     return buf
 
 
-def send_one_shot(color_img, depth_img, command_to_send):
+def send_one_shot(color_img, depth_img, command_to_send, avoidance_attempts):
     """
     매 호출마다 새 소켓 연결 → 송신 → 응답 수신 → 닫기.
-    command_to_send: str | None
+    [개선] avoidance_attempts를 포함한 32바이트 헤더 송신
     """
     t_pi_start = time.time()
 
@@ -122,15 +125,18 @@ def send_one_shot(color_img, depth_img, command_to_send):
     else:
         cmd_data = b''
 
+    # 헤더: cmd_size(I), rgb_size(Q), depth_size(Q), avoidance_attempts(I), t_pi_start(d) → 32 bytes
     header = struct.pack(
-        '<IQQd',
+        '<IQQId',
         len(cmd_data),
         len(color_data),
         len(depth_data),
+        avoidance_attempts,
         t_pi_start,
     )
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(10.0)
         sock.connect((SERVER_HOST, SERVER_PORT))
         sock.sendall(header + cmd_data + color_data + depth_data)
 
@@ -251,33 +257,34 @@ def prompt_after_task_end(current_command, hint):
     return 'new_command', user_input
 
 
-def run_one_cycle(node, motor, current_command, command_dirty):
+def run_one_cycle(node, motor, current_command, command_dirty, avoidance_attempts):
     """
     한 사이클 실행: 프레임 송신 → 응답 수신 → 모터 실행.
 
     Returns:
-        (success, result_dict, new_command_dirty)
+        (success, result_dict, new_command_dirty, next_avoidance_attempts)
         success: True if 사이클 정상 완료, False if 송수신 실패
         result_dict: 서버 응답 (실패 시 None)
         new_command_dirty: 다음 사이클에 명령 재전송 필요 여부
+        next_avoidance_attempts: 서버에서 내려준 다음 시도 횟수
     """
     snapshot = node.get_latest_frame()
     if snapshot is None:
         print('⚠ 카메라 프레임이 아직 없음. 0.2초 후 재시도.')
         time.sleep(0.2)
-        return False, None, command_dirty
+        return False, None, command_dirty, avoidance_attempts
 
     color_img, depth_img, stamp, count = snapshot
     cmd_to_send = current_command if command_dirty else None
     cmd_indicator = "+ 명령" if command_dirty else "(명령 생략)"
-    print(f'\n→ 프레임 #{count} 송신 중 {cmd_indicator}...')
+    print(f'\n→ 프레임 #{count} 송신 중 {cmd_indicator} (avoidance: {avoidance_attempts})...')
 
     # 송신
     try:
-        result, t_start, t_end = send_one_shot(color_img, depth_img, cmd_to_send)
+        result, t_start, t_end = send_one_shot(color_img, depth_img, cmd_to_send, avoidance_attempts)
     except Exception as e:
         node.get_logger().error(f'송신/수신 실패: {e}')
-        return False, None, command_dirty   # dirty 유지 → 다음 시도에 명령 재전송
+        return False, None, command_dirty, avoidance_attempts   # dirty 유지
 
     # 송신 성공 → 서버가 명령을 알고 있음
     new_dirty = False
@@ -290,7 +297,7 @@ def run_one_cycle(node, motor, current_command, command_dirty):
         print(f'⚠ 서버 에러: {reason}')
         if reason == 'no_command_set':
             new_dirty = True   # 서버가 명령을 잃어버림 → 재전송
-        return True, result, new_dirty
+        return True, result, new_dirty, avoidance_attempts
 
     # 모터 실행 (블로킹)
     execution = result.get('execution') or {}
@@ -300,7 +307,10 @@ def run_one_cycle(node, motor, current_command, command_dirty):
     else:
         print('   (실행할 모터 명령 없음)')
 
-    return True, result, new_dirty
+    # [개선] 다음 사이클을 위해 attempts 업데이트
+    next_attempts = execution.get('next_avoidance_attempts', 0)
+
+    return True, result, new_dirty, next_attempts
 
 
 def main():
@@ -312,7 +322,7 @@ def main():
     spin_thread.start()
 
     # 모터 초기화
-    motor = MotorDriver()
+    motor = MotorControl()
 
     # 1) 명령 입력
     current_command = prompt_initial_command()
@@ -337,6 +347,7 @@ def main():
     last_hint = None
     retry_count = 0
     last_retry_reason = None
+    avoidance_attempts = 0
 
     try:
         while True:
@@ -353,11 +364,12 @@ def main():
                 last_hint = None   # 새 사이클 시작
                 retry_count = 0
                 last_retry_reason = None
+                avoidance_attempts = 0
             # else: continue / reevaluate / retry / 첫 진입 → 자동으로 다음 사이클 진행
 
             # 3) 한 사이클 실행 (송신 → 모터까지 블로킹)
-            success, result, command_dirty = run_one_cycle(
-                node, motor, current_command, command_dirty
+            success, result, command_dirty, avoidance_attempts = run_one_cycle(
+                node, motor, current_command, command_dirty, avoidance_attempts
             )
 
             if not success:
