@@ -41,7 +41,7 @@ LINEAR_SPEED_MPS = 0.400   # ★ 0.285 → 0.400
 ANGULAR_SPEED_DPS = 135.0  # ★ 45.0 → 135.0
 
 # 모터 동작 후 settle delay (관성 잦아들기 위해 대기)
-SETTLE_DELAY_S = 0.15
+SETTLE_DELAY_S = 0.4
 
 # 너무 짧은 동작은 모터가 못 따라가니 최소 시간 보장
 MIN_ACTION_TIME_S = 0.05

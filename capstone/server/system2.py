@@ -39,13 +39,12 @@ import time
 #   - "dining table": target이 위에 있을 때 표면이고, 너머에 있을 때 장애물.
 #     2D bbox만으론 이 둘을 원리적으로 구분 못 함. depth 연결 후 복원 예정.
 OBJECT_POOL = [
-    "chair", "couch", "bed", "toilet",
-    "cup", "bottle", "wine glass", "bowl",
-    "banana", "apple", "orange", "sandwich",
-    "remote", "cell phone", "book", "laptop", "keyboard", "mouse",
-    "handbag", "backpack", "suitcase", "scissors",
-    "tv", "refrigerator", "oven", "microwave", "sink",
-    "person", "potted plant",
+    "bottle",
+    "cup",
+    "clock",
+    "sports ball",
+    "car",
+    "handbag",
 ]
 
 
@@ -74,7 +73,7 @@ class VisionPlanner:
         self.hfov_deg = 70.0
 
         # 정렬/거리 허용 오차 (System 1 판단에도 쓰여서 context로 전달)
-        self.center_tolerance_px = 40
+        self.center_tolerance_px = 70
         self.distance_tolerance_m = 0.10
 
         # 장애물 판정 기준 (System 2 영역: 무엇이 막는가)
@@ -145,7 +144,7 @@ class VisionPlanner:
         return False, min_dist_m
 
     def build_planning_prompt(self):
-        """잘된 날 프롬프트 - 짧고 효율적 (3-4초 응답)."""
+        
         pool_str = ", ".join(OBJECT_POOL)
         return f"""You are a planning module for a home service robot.
 Given a user command and the camera image, decide:
@@ -172,19 +171,19 @@ Output format:
 
 Examples:
 User: "I'm thirsty"
--> {{"intent": "drink", "target_object": "cup", "obstacle_classes": ["chair"]}}
+-> {{"intent": "drink", "target_object": "bottle", "obstacle_classes": ["handbag"]}}
 
-User: "My legs hurt, I need to rest"
--> {{"intent": "rest", "target_object": "chair", "obstacle_classes": ["potted plant"]}}
+User: "What time is it?"
+-> {{"intent": "check_time", "target_object": "clock", "obstacle_classes": []}}
 
-User: "Pass me something to read"
--> {{"intent": "read", "target_object": "book", "obstacle_classes": ["couch"]}}
+User: "Let's play"
+-> {{"intent": "play", "target_object": "sports ball", "obstacle_classes": ["cup"]}}
 
-User: "I want to change the channel"
--> {{"intent": "control_tv", "target_object": "remote", "obstacle_classes": []}}
+User: "Bring me my bag"
+-> {{"intent": "fetch_bag", "target_object": "handbag", "obstacle_classes": []}}
 
 User: "Help me find my phone"
-(no phone visible in scene)
+(no phone visible in scene, and phone is not in allowed classes)
 -> {{"intent": "locate_phone", "target_object": null, "obstacle_classes": []}}
 """
 
