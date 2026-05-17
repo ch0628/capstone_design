@@ -16,12 +16,15 @@ System 2 — VisionPlanner (merged: 잘된 날 베이스 + retry/진단/blocking
 
 핵심 인터페이스:
     planner.plan(image, command, depth_map, avoidance_attempts)
-        -> action_command dict {"status", "action", "context", ...}
+        -> action_command dict {"status", "action", "context", "debug_frame", ...}
+
+debug_frame: YOLO BBox가 그려진 BGR numpy (main.py에서 send_to_pc로 Local PC 전송, JSON 응답에는 포함 안 됨)
 """
 
 import json
 import re
 import math
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -32,12 +35,6 @@ import os
 import time
 
 
-# 가정환경에서 다룰 수 있는 COCO 클래스 풀.
-# 같은 클래스가 명령에 따라 target도 되고 obstacle도 됨.
-#
-# [임시 제외] depth 카메라 연결 전까지 표면 역할 케이스 구분 불가:
-#   - "dining table": target이 위에 있을 때 표면이고, 너머에 있을 때 장애물.
-#     2D bbox만으론 이 둘을 원리적으로 구분 못 함. depth 연결 후 복원 예정.
 OBJECT_POOL = [
     "bottle",
     "cup",
@@ -69,21 +66,12 @@ class VisionPlanner:
         print("🚀 [System2 2/2] YOLOv11 엔진 로딩 중...")
         self.yolo = YOLO("yolo11n.pt")
 
-        # 카메라 파라미터
         self.hfov_deg = 70.0
-
-        # 정렬/거리 허용 오차 (System 1 판단에도 쓰여서 context로 전달)
         self.center_tolerance_px = 70
         self.distance_tolerance_m = 0.10
-
-        # 장애물 판정 기준 (System 2 영역: 무엇이 막는가)
-        self.obstacle_angle_corridor_deg = 15.0
+        self.obstacle_angle_corridor_deg = 20.0
         self.obstacle_min_area_ratio = 0.01
-
-        # 회피 한도
         self.max_avoidance_attempts = 3
-
-        # 시스템 설정
         self.target_distance_m = 0.3
         self.emergency_brake_distance_m = 0.3
 
@@ -118,14 +106,10 @@ class VisionPlanner:
         )
 
     def check_emergency_brake(self, depth_map):
-        """
-        로봇 바로 앞(이미지 하단 중앙)에 충돌 위험이 있는 장애물이 있는지 체크.
-        """
         if depth_map is None:
             return False, 0.0
 
         h, w = depth_map.shape[:2]
-        # 위험 구역 : 하단 70%~95% 영역, 좌우 중앙 30% 영역
         y1, y2 = int(h * 0.7), int(h * 0.95)
         x1, x2 = int(w * 0.35), int(w * 0.65)
 
@@ -144,7 +128,6 @@ class VisionPlanner:
         return False, min_dist_m
 
     def build_planning_prompt(self):
-        
         pool_str = ", ".join(OBJECT_POOL)
         return f"""You are a planning module for a home service robot.
 Given a user command and the camera image, decide:
@@ -188,7 +171,6 @@ User: "Help me find my phone"
 """
 
     def parse_vlm_plan(self, raw_text):
-        """잘된 날 코드의 OBJECT_POOL 검증 포함 (hallucination 컷)."""
         json_matches = re.findall(r"\{.*?\}", raw_text, re.DOTALL)
         if not json_matches:
             return None
@@ -199,7 +181,6 @@ User: "Help me find my phone"
             print("⚠️ JSON 파싱 실패")
             return None
 
-        # target_object 검증
         target = data.get("target_object")
         if isinstance(target, str) and target.lower() in ("null", "none", ""):
             target = None
@@ -209,7 +190,6 @@ User: "Help me find my phone"
                 print(f"⚠️ target '{target}'이 OBJECT_POOL에 없음 → null 처리")
                 target = None
 
-        # obstacle_classes 검증 (OBJECT_POOL 안에 있는 것만, target 제외, 중복 제거)
         obstacles = data.get("obstacle_classes", [])
         if not isinstance(obstacles, list):
             obstacles = []
@@ -256,6 +236,61 @@ User: "Help me find my phone"
 
         return best_target, obstacle_dets
 
+    def build_annotated_frame(self, pil_img, target_det, obstacle_dets, plan=None, action=None):
+        """YOLO BBox가 그려진 BGR 프레임 (Local PC debug_frame_sender용)."""
+        frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+        for od in obstacle_dets:
+            x1, y1, x2, y2 = [int(v) for v in od["bbox"]]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(
+                frame,
+                f"{od['class']} {od['conf']:.2f}",
+                (x1, max(y1 - 6, 12)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 255),
+                1,
+            )
+
+        if target_det:
+            x1, y1, x2, y2 = [int(v) for v in target_det["bbox"]]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                frame,
+                f"TARGET {target_det['class']} {target_det['conf']:.2f}",
+                (x1, max(y1 - 6, 12)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 0),
+                2,
+            )
+
+        if plan:
+            label = plan.get("target_object") or "no_target"
+            intent = plan.get("intent") or ""
+            cv2.putText(
+                frame,
+                f"VLM: {label} ({intent})",
+                (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 255),
+                2,
+            )
+        if action:
+            cv2.putText(
+                frame,
+                f"action: {action}",
+                (10, 48),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 0),
+                2,
+            )
+
+        return frame
+
     # ── 기하 ───────────────────────────────────────────────────
 
     def compute_geometry(self, bbox, img_w, img_h):
@@ -288,95 +323,86 @@ User: "Help me find my phone"
         return yaw_deg, pixel_offset, False
 
     def _read_depth_at_bbox(self, depth_map, bbox):
-        """
-        bbox 영역의 depth 값들 중 유효한 것(0이 아닌)의 median을 m 단위로 반환.
-        depth_map은 RealSense raw (uint16, mm 단위) 가정.
-
-        Returns:
-            float: 거리(m). 유효 픽셀 없으면 None.
-        """
         if depth_map is None:
             return None
 
         x1, y1, x2, y2 = [int(v) for v in bbox]
         h, w = depth_map.shape[:2]
 
-        x1 = max(0, min(x1, w - 1))
-        x2 = max(0, min(x2, w))
-        y1 = max(0, min(y1, h - 1))
-        y2 = max(0, min(y2, h))
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        half_w = max(1, (x2 - x1) // 4)
+        half_h = max(1, (y2 - y1) // 4)
 
-        if x2 <= x1 or y2 <= y1:
+        cx1 = cx - half_w
+        cx2 = cx + half_w
+        cy1 = cy - half_h
+        cy2 = cy + half_h
+
+        cx1 = max(0, min(cx1, w - 1))
+        cx2 = max(0, min(cx2, w))
+        cy1 = max(0, min(cy1, h - 1))
+        cy2 = max(0, min(cy2, h))
+
+        if cx2 <= cx1 or cy2 <= cy1:
             return None
 
-        roi = depth_map[y1:y2, x1:x2]
+        roi = depth_map[cy1:cy2, cx1:cx2]
         valid = roi[roi > 0]
 
         if valid.size == 0:
             return None
 
-        distance_mm = float(np.median(valid))
-        return distance_mm / 1000.0
+        return float(np.median(valid)) / 1000.0
 
     # ── 장애물 판정 ────────────────────────────────────────────
 
-    def is_blocking_obstacle(self, obs_geom, obs_distance, target_geom, target_distance):
+    def is_blocking_obstacle(self, obs_geom, obs_bbox, obs_distance,
+                             target_geom, target_bbox, target_distance):
         if obs_distance >= target_distance:
             return False, "behind_target"
+
+        ox1, _, ox2, _ = obs_bbox
+        tx1, _, tx2, _ = target_bbox
+        tw = tx2 - tx1
+        bbox_x_overlap = (ox2 >= (tx1 - tw)) and (ox1 <= (tx2 + tw))
+
         angle_diff = abs(obs_geom["yaw_deg"] - target_geom["yaw_deg"])
-        if angle_diff > self.obstacle_angle_corridor_deg:
+        angle_in_corridor = angle_diff <= self.obstacle_angle_corridor_deg
+
+        if not (bbox_x_overlap or angle_in_corridor):
             return False, "out_of_corridor"
-        if obs_geom["area_ratio"] < self.obstacle_min_area_ratio:
-            return False, "too_small"
+
         return True, "blocking"
 
-    # ── 행동 결정 (System 2의 핵심) ────────────────────────────
+    # ── 행동 결정 ──────────────────────────────────────────────
 
     def select_action(self, target_info, blocking_obstacles, avoidance_attempts, is_emergency=False):
-        """
-        상황을 보고 어떤 '종류'의 행동을 할지만 결정.
-        구체적 수치 계산은 System 1에서 함.
-        """
         if is_emergency:
             return "emergency_stop"
 
-        # 막는 장애물이 있고 회피 한도 초과 → 사용자 대기
+        if not target_info["aligned"]:
+            return "track"
+
         if blocking_obstacles and avoidance_attempts >= self.max_avoidance_attempts:
             return "wait_user"
 
-        # 막는 장애물이 있음 → 회피
         if blocking_obstacles:
             return "avoid_obstacle"
 
-        # 정렬됐고 적정 거리 도달 → 정지
-        if target_info["aligned"]:
-            distance_error = target_info["distance"] - self.target_distance_m
-            if abs(distance_error) <= self.distance_tolerance_m:
-                return "stop_at_target"
+        distance_error = target_info["distance"] - self.target_distance_m
+        if abs(distance_error) <= self.distance_tolerance_m:
+            return "stop_at_target"
 
-        # 그 외 → 추적
         return "track"
 
     # ── 메인 진입점 ────────────────────────────────────────────
 
     def plan(self, image, command, depth_map, avoidance_attempts=0):
-        """
-        이미지+명령 → action_command.
-
-        Args:
-            image: PIL.Image 객체 또는 이미지 파일 경로(str).
-            command: 자연어 사용자 명령
-            depth_map: numpy 배열, shape (H, W), dtype uint16, mm 단위.
-            avoidance_attempts: 누적 회피 시도 횟수.
-
-        Returns:
-            action_command dict (status: success/retry/abort)
-        """
         t_total_start = time.time()
         timings = {}
 
         try:
-            # 입력 정규화
             if isinstance(image, str):
                 pil_img = Image.open(image).convert("RGB")
                 src_label = f"'{image}'"
@@ -390,12 +416,10 @@ User: "Help me find my phone"
                 f"(명령: {command}, attempts={avoidance_attempts})"
             )
 
-            # 0. 긴급 제동 체크
             is_emergency, min_dist = self.check_emergency_brake(depth_map)
             if is_emergency:
                 print(f"🚨 [Emergency] 전방 {min_dist:.2f}m에 장애물 → emergency_stop")
 
-            # 1. VLM
             t_vlm = time.time()
             sys_prompt = self.build_planning_prompt()
             res_vlm = self.ask_vlm(pil_img, sys_prompt, command)
@@ -423,14 +447,16 @@ User: "Help me find my phone"
                     "plan": plan, "timings": timings,
                 }
 
-            # 2. YOLO
             t_yolo = time.time()
             target_det, obstacle_dets = self.detect_objects(
                 pil_img, target_obj, obstacle_classes
             )
             timings["yolo_ms"] = round((time.time() - t_yolo) * 1000, 2)
 
-            # ★ 진단: YOLO 검출 결과
+            annotated_frame = self.build_annotated_frame(
+                pil_img, target_det, obstacle_dets, plan=plan
+            )
+
             print(f"   🔍 [YOLO] target_det={'O' if target_det else 'X'}, obstacle_dets={len(obstacle_dets)}건")
             if target_det:
                 print(f"   🎯 [YOLO target] bbox={[round(v,1) for v in target_det['bbox']]} "
@@ -446,25 +472,61 @@ User: "Help me find my phone"
                     "status": "retry", "action": "retry",
                     "reason": "target_not_found",
                     "plan": plan, "timings": timings,
+                    "debug_frame": annotated_frame,
                 }
 
-            # 3. 기하 + depth + 결정 (= post-processing)
             t_post = time.time()
             target_geom = self.compute_geometry(target_det["bbox"], img_w, img_h)
 
-            # 3-1. Target 거리 측정
             target_distance = self._read_depth_at_bbox(depth_map, target_det["bbox"])
             if target_distance is None:
+                # target은 보이지만 depth 측정 불가 (너무 가깝거나 표면 측정 실패)
+                # → 정렬 여부에 따라 track / stop_at_target 분기
+                aligned = target_geom["aligned"]
+                target_info = {
+                    "class": target_det["class"],
+                    "conf": round(target_det["conf"], 3),
+                    "bbox": target_det["bbox"],
+                    "cx": target_geom["cx"],
+                    "yaw_deg": target_geom["yaw_deg"],
+                    "aligned": aligned,
+                    "distance": None,
+                    "distance_error": None,
+                }
+                context = {
+                    "target": target_info,
+                    "obstacles": [],
+                    "blocking_obstacles": [],
+                    "image": {
+                        "width": img_w,
+                        "height": img_h,
+                        "hfov_deg": self.hfov_deg,
+                    },
+                    "config": {
+                        "target_distance_m": self.target_distance_m,
+                        "distance_tolerance_m": self.distance_tolerance_m,
+                        "center_tolerance_px": self.center_tolerance_px,
+                    },
+                    "avoidance_attempts": avoidance_attempts,
+                }
+                if aligned:
+                    action = "stop_at_target"
+                    print(f"📏 [Depth] target=N/A (정렬됨 → stop_at_target, 너무 가까움)")
+                else:
+                    action = "track"
+                    print(f"📏 [Depth] target=N/A (정렬 우선)")
                 timings["post_ms"] = round((time.time() - t_post) * 1000, 2)
                 timings["total_ms"] = round((time.time() - t_total_start) * 1000, 2)
                 return {
-                    "status": "retry", "action": "retry",
-                    "reason": "target_depth_unavailable",
-                    "plan": plan, "timings": timings,
+                    "status": "success",
+                    "action": action,
+                    "context": context,
+                    "plan": plan,
+                    "timings": timings,
+                    "debug_frame": annotated_frame,
                 }
             print(f"📏 [Depth] target={target_distance:.2f}m")
 
-            # 3-2. 장애물 판정
             obstacles_info = []
             blocking_obstacles = []
 
@@ -477,14 +539,19 @@ User: "Help me find my phone"
                     obs_distance = max(0.01, target_distance - 0.01)
 
                 blocking, reason = self.is_blocking_obstacle(
-                    og, obs_distance, target_geom, target_distance
+                    og, od["bbox"], obs_distance,
+                    target_geom, target_det["bbox"], target_distance,
                 )
 
-                # ★ 진단: 장애물 필터링 상세
+                ox1, _, ox2, _ = od["bbox"]
+                tx1, _, tx2, _ = target_det["bbox"]
+                tw = tx2 - tx1
+                x_overlap = (ox2 >= (tx1 - tw)) and (ox1 <= (tx2 + tw))
+
                 print(f"   🔍 [obstacle filter] {od['class']} "
                       f"conf={od['conf']:.2f} "
                       f"dist={obs_distance:.2f}m yaw={og['yaw_deg']:+.1f}° "
-                      f"area={og['area_ratio']:.3f} "
+                      f"x_overlap={'O' if x_overlap else 'X'} "
                       f"→ {'BLOCKING' if blocking else f'skip({reason})'}")
 
                 entry = {
@@ -500,10 +567,8 @@ User: "Help me find my phone"
                 }
                 obstacles_info.append(entry)
                 if blocking:
-                    # ★ system1 동적 회피 계산을 위해 yaw_deg, distance가 포함됨
                     blocking_obstacles.append(entry)
 
-            # 4. target context 정리
             target_info = {
                 "class": target_det["class"],
                 "conf": round(target_det["conf"], 3),
@@ -515,12 +580,14 @@ User: "Help me find my phone"
                 "distance_error": target_distance - self.target_distance_m,
             }
 
-            # 5. 행동 종류 결정
             action = self.select_action(
                 target_info, blocking_obstacles, avoidance_attempts, is_emergency
             )
 
-            # 6. context 패키징
+            annotated_frame = self.build_annotated_frame(
+                pil_img, target_det, obstacle_dets, plan=plan, action=action
+            )
+
             context = {
                 "target": target_info,
                 "obstacles": obstacles_info,
@@ -547,6 +614,7 @@ User: "Help me find my phone"
                 "context": context,
                 "plan": plan,
                 "timings": timings,
+                "debug_frame": annotated_frame,
             }
 
         except Exception as e:

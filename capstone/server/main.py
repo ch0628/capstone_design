@@ -2,26 +2,27 @@
 main.py — GPU 서버 메인 진입점
 
 RPi의 sender.py와 짝꿍이 되는 서버.
-- 9999 포트 listen
-- RPi가 보낸 (명령? + RGB + Depth) 받음
-- system2.plan() + system1.execute() 호출
-- 결과 JSON으로 응답
+- LISTEN_PORT (기본 9999): RPi → RGB + Depth + 명령, JSON 응답
+- DEBUG_STREAM_PORT (기본 10000, debug_frame_sender): Local PC ← YOLO annotated JPEG
 """
 
+import os
 import socket
 import struct
 import json
 import time
 import io
+import sys
 import numpy as np
 from PIL import Image
 
 from system2 import VisionPlanner
 from system1 import MotionExecutor
+from debug_frame_sender import get_debug_sender, send_to_pc
 
 
-LISTEN_HOST = "0.0.0.0"
-LISTEN_PORT = 9999
+LISTEN_HOST = os.getenv("SERAPH_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.getenv("SERAPH_PORT", "9999"))
 
 HEADER_SIZE = 28
 HEADER_FMT = "<IQQd"
@@ -185,6 +186,11 @@ def handle_one_request(conn, planner, executor, cmd_state):
 
     _print_plan_diagnostics(action_command)
 
+    # YOLO annotated frame → Local PC (non-blocking, 전송 실패해도 파이프라인 계속)
+    debug_frame = action_command.pop("debug_frame", None)
+    if debug_frame is not None:
+        send_to_pc(debug_frame)
+
     t_exec_start = time.time()
     execution = executor.execute(action_command)
     t_exec_done = time.time()
@@ -221,6 +227,7 @@ def handle_one_request(conn, planner, executor, cmd_state):
 def _strip_internal(action_command):
     if not isinstance(action_command, dict):
         return action_command
+    action_command.pop("debug_frame", None)
     if "context" in action_command:
         ctx = action_command["context"]
         if "target" in ctx and isinstance(ctx["target"].get("bbox"), list):
@@ -236,22 +243,53 @@ def _strip_internal(action_command):
     return action_command
 
 
+def create_listen_socket(host, port, label="RPi"):
+    """모델 로딩 전 포트 선점 — 충돌 시 VLM 로딩 시간 낭비 방지."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_REUSEPORT"):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
+    try:
+        sock.bind((host, port))
+    except OSError as e:
+        errno = getattr(e, "errno", None)
+        in_use = errno in (98, 48, 10048) or "Address already in use" in str(e)
+        if in_use:
+            print(
+                f"\n❌ 포트 {port} ({label})이(가) 이미 사용 중입니다.\n"
+                f"   → 이전 main.py 또는 팀원 프로세스가 점유 중일 수 있습니다.\n"
+                f"   확인: ss -tlnp | grep ':{port}'\n"
+                f"         fuser -v {port}/tcp\n"
+                f"   종료: kill $(fuser {port}/tcp 2>/dev/null)\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        raise
+    sock.listen(5)
+    return sock
+
+
 def main():
     print("=" * 60)
     print("🚀 Seraph 서버 시작")
-    print(f"   listen: {LISTEN_HOST}:{LISTEN_PORT}")
+    print(f"   RPi listen: {LISTEN_HOST}:{LISTEN_PORT}")
+    print(f"   Debug stream: 0.0.0.0:{os.getenv('DEBUG_STREAM_PORT', '10000')} (Local PC)")
     print(f"   기대 해상도: {EXPECTED_W}x{EXPECTED_H}")
     print(f"   명령은 RPi가 첫 송신 시 동봉 (cmd_size>0)")
     print("=" * 60)
+
+    server_sock = create_listen_socket(LISTEN_HOST, LISTEN_PORT, label="RPi")
+    print(f"✅ RPi 포트 확보: {LISTEN_HOST}:{LISTEN_PORT}")
 
     planner = VisionPlanner()
     executor = MotionExecutor()
     cmd_state = CommandState()
 
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind((LISTEN_HOST, LISTEN_PORT))
-    server_sock.listen(5)
+    if get_debug_sender() is None:
+        print("⚠️  DebugStream 미사용 — YOLO 프레임 Local 저장만 비활성화됩니다.")
     print(f"\n👂 RPi 연결 대기 중...")
 
     try:
