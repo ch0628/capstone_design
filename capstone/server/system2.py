@@ -28,7 +28,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from transformers import AutoProcessor, AutoModelForImageTextToText
+from transformers import AutoProcessor, AutoModelForImageTextToText, AutoImageProcessor, AutoModelForDepthEstimation
 from ultralytics import YOLO
 from dotenv import load_dotenv
 import os
@@ -52,7 +52,7 @@ class VisionPlanner:
         if not hf_token:
             raise ValueError("HF_TOKEN이 .env 파일에 없습니다.")
 
-        print("🚀 [System2 1/2] VLM(Qwen3.5-4B) 로딩 중...")
+        print("🚀 [System2 1/3] VLM(Qwen3.5-4B) 로딩 중...")
         vlm_id = "Qwen/Qwen3.5-4B"
         self.processor = AutoProcessor.from_pretrained(vlm_id, token=hf_token)
         self.vlm = AutoModelForImageTextToText.from_pretrained(
@@ -63,8 +63,18 @@ class VisionPlanner:
             attn_implementation="sdpa",
         )
 
-        print("🚀 [System2 2/2] YOLOv11 엔진 로딩 중...")
+        print("🚀 [System2 2/3] YOLOv11 엔진 로딩 중...")
         self.yolo = YOLO("yolo11n.pt")
+
+        print("🚀 [System2 3/3] Depth Anything V2 (Metric Indoor Small) 로딩 중...")
+        self.da_processor = AutoImageProcessor.from_pretrained(
+            "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
+        )
+        self.da_model = AutoModelForDepthEstimation.from_pretrained(
+            "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf",
+            torch_dtype=torch.float32,
+        ).to(self.vlm.device)
+        self.da_model.eval()
 
         self.hfov_deg = 70.0
         self.center_tolerance_px = 70
@@ -322,38 +332,75 @@ User: "Help me find my phone"
         yaw_deg = math.degrees(yaw_rad)
         return yaw_deg, pixel_offset, False
 
-    def _read_depth_at_bbox(self, depth_map, bbox):
-        if depth_map is None:
-            return None
+    def predict_depth_anything(self, pil_img):
+        """
+        Depth Anything V2 (Metric Indoor Small)로 metric depth map 추론.
 
+        Args:
+            pil_img: PIL Image, RGB.
+
+        Returns:
+            numpy array (H, W), dtype float32, m 단위. 원본 이미지 크기로 보간됨.
+        """
+        inputs = self.da_processor(images=pil_img, return_tensors="pt").to(self.da_model.device)
+
+        with torch.no_grad():
+            outputs = self.da_model(**inputs)
+            predicted_depth = outputs.predicted_depth
+
+        img_w, img_h = pil_img.size
+        prediction = torch.nn.functional.interpolate(
+            predicted_depth.unsqueeze(1),
+            size=(img_h, img_w),
+            mode="bicubic",
+            align_corners=False,
+        )
+        return prediction.squeeze().cpu().numpy().astype(np.float32)
+
+    def _read_depth_at_bbox(self, rs_depth, da_depth, bbox):
+        """
+        RealSense 우선, valid 픽셀 0개일 때만 DA fallback.
+
+        Args:
+            rs_depth: RealSense raw depth map, numpy uint16, mm 단위.
+            da_depth: DA dense depth map, numpy float32, m 단위.
+            bbox: [x1, y1, x2, y2].
+
+        Returns:
+            tuple (distance_m, source).
+            source: "realsense" | "depth_anything" | "failed"
+            distance가 None이면 source는 "failed".
+        """
         x1, y1, x2, y2 = [int(v) for v in bbox]
-        h, w = depth_map.shape[:2]
+        h, w = rs_depth.shape[:2]
 
         cx = (x1 + x2) // 2
         cy = (y1 + y2) // 2
         half_w = max(1, (x2 - x1) // 4)
         half_h = max(1, (y2 - y1) // 4)
 
-        cx1 = cx - half_w
-        cx2 = cx + half_w
-        cy1 = cy - half_h
-        cy2 = cy + half_h
-
-        cx1 = max(0, min(cx1, w - 1))
-        cx2 = max(0, min(cx2, w))
-        cy1 = max(0, min(cy1, h - 1))
-        cy2 = max(0, min(cy2, h))
+        cx1 = max(0, min(cx - half_w, w - 1))
+        cx2 = max(0, min(cx + half_w, w))
+        cy1 = max(0, min(cy - half_h, h - 1))
+        cy2 = max(0, min(cy + half_h, h))
 
         if cx2 <= cx1 or cy2 <= cy1:
-            return None
+            return None, "failed"
 
-        roi = depth_map[cy1:cy2, cx1:cx2]
-        valid = roi[roi > 0]
+        # 1순위: RealSense (원래 로직 그대로)
+        rs_roi = rs_depth[cy1:cy2, cx1:cx2]
+        rs_valid = rs_roi[rs_roi > 0]
+        if rs_valid.size > 0:
+            return float(np.median(rs_valid)) / 1000.0, "realsense"
 
-        if valid.size == 0:
-            return None
-
-        return float(np.median(valid)) / 1000.0
+        # 2순위: DA fallback
+        if da_depth is None:
+            return None, "failed"
+        da_roi = da_depth[cy1:cy2, cx1:cx2]
+        da_valid = da_roi[np.isfinite(da_roi) & (da_roi > 0)]
+        if da_valid.size == 0:
+            return None, "failed"
+        return float(np.median(da_valid)), "depth_anything"
 
     # ── 장애물 판정 ────────────────────────────────────────────
 
@@ -453,6 +500,11 @@ User: "Help me find my phone"
             )
             timings["yolo_ms"] = round((time.time() - t_yolo) * 1000, 2)
 
+            t_da = time.time()
+            da_depth = self.predict_depth_anything(pil_img)
+            timings["da_ms"] = round((time.time() - t_da) * 1000, 2)
+            print(f"📏 [Depth Anything] 추론 완료 ({timings['da_ms']:.1f}ms)")
+
             annotated_frame = self.build_annotated_frame(
                 pil_img, target_det, obstacle_dets, plan=plan
             )
@@ -478,7 +530,7 @@ User: "Help me find my phone"
             t_post = time.time()
             target_geom = self.compute_geometry(target_det["bbox"], img_w, img_h)
 
-            target_distance = self._read_depth_at_bbox(depth_map, target_det["bbox"])
+            target_distance, target_source = self._read_depth_at_bbox(depth_map, da_depth, target_det["bbox"])
             if target_distance is None:
                 # target은 보이지만 depth 측정 불가 (너무 가깝거나 표면 측정 실패)
                 # → 정렬 여부에 따라 track / stop_at_target 분기
@@ -525,7 +577,7 @@ User: "Help me find my phone"
                     "timings": timings,
                     "debug_frame": annotated_frame,
                 }
-            print(f"📏 [Depth] target={target_distance:.2f}m")
+            print(f"📏 [Depth] target={target_distance:.2f}m (source: {target_source})")
 
             obstacles_info = []
             blocking_obstacles = []
@@ -533,10 +585,11 @@ User: "Help me find my phone"
             for od in obstacle_dets:
                 og = self.compute_geometry(od["bbox"], img_w, img_h)
 
-                obs_distance = self._read_depth_at_bbox(depth_map, od["bbox"])
-                depth_failed = obs_distance is None
-                if depth_failed:
-                    obs_distance = max(0.01, target_distance - 0.01)
+                obs_distance, obs_source = self._read_depth_at_bbox(depth_map, da_depth, od["bbox"])
+                if obs_distance is None:
+                    # RealSense + DA 모두 측정 실패 → 이 obstacle은 건너뛰기
+                    print(f"   ⚠️ [obstacle skip] {od['class']} depth 측정 실패 (RealSense + DA 모두 실패)")
+                    continue
 
                 blocking, reason = self.is_blocking_obstacle(
                     og, od["bbox"], obs_distance,
@@ -550,7 +603,7 @@ User: "Help me find my phone"
 
                 print(f"   🔍 [obstacle filter] {od['class']} "
                       f"conf={od['conf']:.2f} "
-                      f"dist={obs_distance:.2f}m yaw={og['yaw_deg']:+.1f}° "
+                      f"dist={obs_distance:.2f}m({obs_source}) yaw={og['yaw_deg']:+.1f}° "
                       f"x_overlap={'O' if x_overlap else 'X'} "
                       f"→ {'BLOCKING' if blocking else f'skip({reason})'}")
 
@@ -561,7 +614,8 @@ User: "Help me find my phone"
                     "yaw_deg": og["yaw_deg"],
                     "area_ratio": round(og["area_ratio"], 4),
                     "distance": round(obs_distance, 3),
-                    "depth_measurement": "estimated_failed" if depth_failed else "measured",
+                    "depth_source": obs_source,
+                    "depth_measurement": "measured",
                     "blocking": blocking,
                     "skip_reason": None if blocking else reason,
                 }

@@ -103,7 +103,6 @@ class MotionExecutor:
     def _execute_avoid_obstacle(self, context):
         """
         가장 가까운 blocking 장애물 기준으로 분기:
-          (a) depth 측정 실패 → 0.3m로 가정하고 (c)로 회피
           (b) 0.3m 이상 → 직진해서 거리 좁힘 (회피 안 함)
           (c) 0.3m 미만 → 회전 + 전진 회피
         """
@@ -115,26 +114,17 @@ class MotionExecutor:
 
         # 가장 위험한 장애물 = 거리가 가장 가까운 것
         most_blocking = min(blocking, key=lambda o: o["distance"])
+        obstacle_distance = most_blocking["distance"]
 
-        # ── 분기 (a): depth 실패 → 0.3m 가정 후 (c)로 fallthrough ──
-        if most_blocking.get("depth_measurement") == "estimated_failed":
-            obstacle_distance = 0.3
+        # ── 분기 (b): 아직 멀어서 거리만 좁힘 ──────────────────
+        if obstacle_distance >= 0.3:
+            move_dist = min(obstacle_distance - 0.3, self.max_forward_per_cycle_m)
             print(
                 f"   ↪ 회피 대상: {most_blocking['class']} "
-                f"(depth 측정 실패 → 0.3m로 가정하고 회피)"
+                f"(obstacle={obstacle_distance:.2f}m ≥ 0.3m → 직진 {move_dist:.2f}m로 거리 좁힘)"
             )
-        else:
-            obstacle_distance = most_blocking["distance"]
-
-            # ── 분기 (b): 아직 멀어서 거리만 좁힘 ──────────────
-            if obstacle_distance >= 0.3:
-                move_dist = min(obstacle_distance - 0.3, self.max_forward_per_cycle_m)
-                print(
-                    f"   ↪ 회피 대상: {most_blocking['class']} "
-                    f"(obstacle={obstacle_distance:.2f}m ≥ 0.3m → 직진 {move_dist:.2f}m로 거리 좁힘)"
-                )
-                executed.append(self._motor_move("front", move_dist))
-                return executed, "reevaluate"
+            executed.append(self._motor_move("front", move_dist))
+            return executed, "reevaluate"
 
         # ── 분기 (c): 0.3m 미만 → 회전 + 전진 회피 ─────────────
         # 회피 방향
