@@ -42,7 +42,7 @@ ANGULAR_SPEED_DPS = 135.0  # ★ 45.0 → 135.0
 
 # 모터 동작 후 settle delay (관성 잦아들기 위해 대기)
 TURN_SETTLE_DELAY_S = 1.0   # 회전 후 카메라 안정화에 더 오래 필요
-MOVE_SETTLE_DELAY_S = 0.4
+MOVE_SETTLE_DELAY_S = 1.0
 
 # 너무 짧은 동작은 모터가 못 따라가니 최소 시간 보장
 MIN_ACTION_TIME_S = 0.05
