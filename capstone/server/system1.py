@@ -13,7 +13,6 @@ System 2가 보낸 action_command를 받아서:
   - "stop_at_target"  : 모든 모터 정지
   - "wait_user"       : 사용자 메시지 출력하고 대기
   - "retry"           : 모터 동작 없이 sender에게 reason 전달 (재시도 유도)
-  - "emergency_stop"  : 긴급 제동
   - "abort"           : 시스템 에러 → STOP
 
 핵심 인터페이스:
@@ -32,9 +31,8 @@ import math
 class MotionExecutor:
     def __init__(self):
         # 회피 동작 파라미터
-        self.avoid_safety_margin_deg = 15.0
-        self.avoid_turn_min_deg = 10.0
-        self.avoid_turn_max_deg = 30.0
+        self.avoid_safety_margin_deg = 20.0  # 장애물 far edge 이후 추가 여유 (15→20)
+        self.avoid_turn_min_deg = 20.0       # 최소 회전량 보장 (10→20)
         self.avoid_pass_buffer_m = 0.1   # 장애물 너머 여유 마진
 
         # 한 사이클당 최대 이동/회전
@@ -102,10 +100,13 @@ class MotionExecutor:
 
     def _execute_avoid_obstacle(self, context):
         """
-        가장 가까운 blocking 장애물 기준으로 분기:
-          (a) depth 측정 실패 → 0.3m로 가정하고 (c)로 회피
-          (b) 0.3m 이상 → 직진해서 거리 좁힘 (회피 안 함)
-          (c) 0.3m 미만 → 회전 + 전진 회피
+        보수적 회피: blocking 판정이 내려진 순간 거리와 무관하게 즉시 회피.
+          (a) depth 측정 실패(추정값도 없음) → 0.3m로 가정하고 회피
+          (b) depth 측정 성공 or 추정 성공 → 즉시 회전 + 전진 회피
+              (기존 '멀면 직진' 분기 제거 — blocking 판정이 났으면 직진은 위험)
+
+        복귀 회전은 회피 각도의 70%만 수행하여 타겟 방향을 어느 정도 유지.
+        다음 프레임 track이 나머지 정렬을 처리.
         """
         target = context["target"]
         blocking = context["blocking_obstacles"]
@@ -116,62 +117,65 @@ class MotionExecutor:
         # 가장 위험한 장애물 = 거리가 가장 가까운 것
         most_blocking = min(blocking, key=lambda o: o["distance"])
 
-        # ── 분기 (a): depth 실패 → 0.3m 가정 후 (c)로 fallthrough ──
+        # ── 분기 (a): depth/추정 모두 실패 → 0.3m 보수 가정 ──
         if most_blocking.get("depth_measurement") == "estimated_failed":
             obstacle_distance = 0.3
             print(
                 f"   ↪ 회피 대상: {most_blocking['class']} "
-                f"(depth 측정 실패 → 0.3m로 가정하고 회피)"
+                f"(depth 실패 → 0.3m 가정, 즉시 회피)"
             )
         else:
+            # ── 분기 (b): 즉시 회피 (거리 무관) ──
             obstacle_distance = most_blocking["distance"]
+            print(
+                f"   ↪ 회피 대상: {most_blocking['class']} "
+                f"(dist={obstacle_distance:.2f}m → 즉시 회피)"
+            )
 
-            # ── 분기 (b): 아직 멀어서 거리만 좁힘 ──────────────
-            if obstacle_distance >= 0.3:
-                move_dist = min(obstacle_distance - 0.3, self.max_forward_per_cycle_m)
-                print(
-                    f"   ↪ 회피 대상: {most_blocking['class']} "
-                    f"(obstacle={obstacle_distance:.2f}m ≥ 0.3m → 직진 {move_dist:.2f}m로 거리 좁힘)"
-                )
-                executed.append(self._motor_move("front", move_dist))
-                return executed, "reevaluate"
-
-        # ── 분기 (c): 0.3m 미만 → 회전 + 전진 회피 ─────────────
-        # 회피 방향
+        # ── 회피 방향 결정 ──
         if most_blocking["yaw_deg"] > target["yaw_deg"]:
             avoid_dir = "left"
         else:
             avoid_dir = "right"
 
-        # bbox 기반 회피 각도 (상한 제거, 하한만 유지)
+        # ── far edge 기반 회피 각도 ──
+        # 장애물의 "먼 쪽 끝"까지의 각도를 기준으로 삼아야 완전히 통과할 수 있음.
+        # 기존 half_width 기반은 장애물 가장자리를 겨우 넘는 수준이어서 자주 충돌.
+        # left 회피 시 → 오른쪽 끝(x2), right 회피 시 → 왼쪽 끝(x1) 기준
         x1, _, x2, _ = most_blocking["bbox"]
-        half_width_px = (x2 - x1) / 2
         hfov_rad = math.radians(hfov_deg)
         fx = (img_w / 2) / math.tan(hfov_rad / 2)
-        half_angle_deg = math.degrees(math.atan(half_width_px / fx))
+        img_cx = img_w / 2
 
-        raw_turn = half_angle_deg + self.avoid_safety_margin_deg
+        if avoid_dir == "left":
+            far_edge_px = abs(x2 - img_cx)  # 오른쪽 끝이 중심에서 얼마나 떨어져 있나
+        else:
+            far_edge_px = abs(img_cx - x1)  # 왼쪽 끝이 중심에서 얼마나 떨어져 있나
+
+        far_edge_angle_deg = math.degrees(math.atan(far_edge_px / fx))
+        raw_turn = far_edge_angle_deg + self.avoid_safety_margin_deg
         clamped_turn = max(self.avoid_turn_min_deg, raw_turn)
 
-        # 장애물 거리 기반 전진 (한 사이클당 max 캡 적용)
+        # ── 전진 거리: 최소 0.15m 보장 (너무 짧으면 장애물을 완전히 통과 못함) ──
         avoid_forward = min(
-            obstacle_distance + self.avoid_pass_buffer_m,
+            max(obstacle_distance + self.avoid_pass_buffer_m, 0.15),
             self.max_forward_per_cycle_m,
         )
 
-        # 복귀 회전: 회피 회전과 같은 각도, 반대 방향
+        # ── 복귀 회전: 70%만 수행 → 타겟 방향 부분 유지 ──
+        # 100%로 복귀하면 회전 오차가 누적되어 타겟을 잃을 수 있음
         return_dir = "right" if avoid_dir == "left" else "left"
+        return_turn = round(clamped_turn * 0.7, 2)
 
         print(
-            f"   ↪ 회피 대상: {most_blocking['class']} "
-            f"(obstacle={obstacle_distance:.2f}m, "
-            f"turn raw={raw_turn:.2f}°, clamped={clamped_turn:.2f}°, "
-            f"forward={avoid_forward:.2f}m, return turn {clamped_turn:.2f}°)"
+            f"   ↪ turn={clamped_turn:.2f}°({avoid_dir}), "
+            f"forward={avoid_forward:.2f}m, "
+            f"return={return_turn:.2f}°({return_dir})"
         )
 
         executed.append(self._motor_turn(avoid_dir, clamped_turn))
         executed.append(self._motor_move("front", avoid_forward))
-        executed.append(self._motor_turn(return_dir, clamped_turn))
+        executed.append(self._motor_turn(return_dir, return_turn))
 
         return executed, "reevaluate"
 
@@ -231,12 +235,7 @@ class MotionExecutor:
         current_attempts = context.get("avoidance_attempts", 0)
 
         # 행동별 분기
-        if action == "emergency_stop":
-            executed = [self._motor_stop()]
-            print("🚨 [긴급 제동] 로봇 바로 앞에 장애물이 감지되어 정지합니다.")
-            hint = "reevaluate"
-            next_attempts = current_attempts
-        elif action == "track":
+        if action == "track":
             executed, hint = self._execute_track(context)
             next_attempts = 0
         elif action == "avoid_obstacle":

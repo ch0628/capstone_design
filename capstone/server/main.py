@@ -116,11 +116,12 @@ def _print_plan_diagnostics(action_command):
         target = context.get("target", {})
         blocking = context.get("blocking_obstacles", [])
 
-        target_dist = target.get("distance", 0)
+        target_dist = target.get("distance")  # dead zone 시 None 가능
         target_yaw = target.get("yaw_deg", 0)
         target_aligned = target.get("aligned", False)
+        dist_str = f"{target_dist:.2f}m" if target_dist is not None else "N/A"
         print(f"🎯 [Target] {target.get('class')} "
-              f"dist={target_dist:.2f}m yaw={target_yaw:+.1f}° aligned={target_aligned}")
+              f"dist={dist_str} yaw={target_yaw:+.1f}° aligned={target_aligned}")
 
         print(f"🚧 [Blocking] {len(blocking)}건 (action={action})")
         for b in blocking:
@@ -137,7 +138,7 @@ def handle_one_request(conn, planner, executor, cmd_state):
     cmd_str, rgb_bytes, depth_bytes, t_pi_start = receive_one_frame(conn)
     if rgb_bytes is None:
         print("⚠️ 연결 끊김 또는 데이터 없음")
-        return False
+        return
 
     if cmd_str is not None:
         cmd_state.update(cmd_str)
@@ -150,7 +151,7 @@ def handle_one_request(conn, planner, executor, cmd_state):
             "reason": "no_command_set",
             "command": None,
         })
-        return True
+        return
 
     command = cmd_state.current
 
@@ -168,7 +169,7 @@ def handle_one_request(conn, planner, executor, cmd_state):
             "reason": str(e),
             "command": command,
         })
-        return True
+        return
 
     print(f"🖼  RGB: PIL Image {pil_img.size}, mode={pil_img.mode}")
     print(f"📊 Depth: shape={depth_map.shape}, dtype={depth_map.dtype}, "

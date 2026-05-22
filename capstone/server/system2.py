@@ -10,7 +10,6 @@ System 2 — VisionPlanner (merged: 잘된 날 베이스 + retry/진단/blocking
   - "avoid_obstacle"  : 회피 동작 필요
   - "stop_at_target"  : 목표 거리 도달, 정지
   - "wait_user"       : 사용자 개입 대기 (회피 한도 초과 등)
-  - "emergency_stop"  : 긴급 제동 (충돌 위험)
   - "retry"           : 일시적 실패, 다음 프레임에서 재시도
   - "abort"           : 시스템 에러 (예외 발생)
 
@@ -72,8 +71,13 @@ class VisionPlanner:
         self.obstacle_angle_corridor_deg = 20.0
         self.obstacle_min_area_ratio = 0.01
         self.max_avoidance_attempts = 3
-        self.target_distance_m = 0.3
-        self.emergency_brake_distance_m = 0.3
+        self.target_distance_m = 0.15      # 목표: 타겟 15cm 앞에서 정지
+        self.obstacle_avoid_early_m = 0.50  # 보수적 회피: 이 거리 이내 장애물부터 회피 시작
+
+        # 삼각형 유사 원리로 depth dead zone을 극복하기 위한 캐시
+        # 마지막으로 depth가 유효했을 때의 (거리_m, bbox_픽셀_높이) 저장
+        self._last_target_depth_cache: dict[str, tuple[float, float]] = {}
+        self._last_obs_depth_cache: dict[str, tuple[float, float]] = {}
 
         print("✅ System2(VisionPlanner) 준비 완료")
 
@@ -104,28 +108,6 @@ class VisionPlanner:
         return self.processor.decode(
             outputs[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True,
         )
-
-    def check_emergency_brake(self, depth_map):
-        if depth_map is None:
-            return False, 0.0
-
-        h, w = depth_map.shape[:2]
-        y1, y2 = int(h * 0.7), int(h * 0.95)
-        x1, x2 = int(w * 0.35), int(w * 0.65)
-
-        roi = depth_map[y1:y2, x1:x2]
-        valid = roi[roi > 0]
-
-        if valid.size == 0:
-            return False, 0.0
-
-        min_dist_mm = np.min(valid)
-        min_dist_m = float(min_dist_mm) / 1000.0
-
-        if min_dist_m < self.emergency_brake_distance_m:
-            return True, min_dist_m
-
-        return False, min_dist_m
 
     def build_planning_prompt(self):
         pool_str = ", ".join(OBJECT_POOL)
@@ -211,8 +193,8 @@ User: "Help me find my phone"
 
     # ── YOLO ───────────────────────────────────────────────────
 
-    def detect_objects(self, pil_img, target_class, obstacle_classes):
-        yolo_results = self.yolo.predict(pil_img, conf=0.05, verbose=False)
+    def detect_objects(self, pil_img, target_class, obstacle_classes, conf=0.05):
+        yolo_results = self.yolo.predict(pil_img, conf=conf, verbose=False)
 
         target_class_lower = target_class.lower() if target_class else None
         obstacle_classes_lower = [c.lower() for c in obstacle_classes]
@@ -222,17 +204,21 @@ User: "Help me find my phone"
         obstacle_dets = []
 
         for r in yolo_results:
+            img_h_orig, img_w_orig = r.orig_shape
             for box in r.boxes:
                 label = r.names[int(box.cls[0])].lower()
-                conf = float(box.conf[0])
+                conf_val = float(box.conf[0])
                 bbox = box.xyxy[0].tolist()
 
                 if target_class_lower and label == target_class_lower:
-                    if conf > best_target_conf:
-                        best_target_conf = conf
-                        best_target = {"class": label, "conf": conf, "bbox": bbox}
+                    if conf_val > best_target_conf:
+                        best_target_conf = conf_val
+                        best_target = {"class": label, "conf": conf_val, "bbox": bbox}
                 elif label in obstacle_classes_lower:
-                    obstacle_dets.append({"class": label, "conf": conf, "bbox": bbox})
+                    x1, y1, x2, y2 = bbox
+                    area_ratio = ((x2 - x1) * (y2 - y1)) / (img_w_orig * img_h_orig)
+                    if area_ratio >= self.obstacle_min_area_ratio:
+                        obstacle_dets.append({"class": label, "conf": conf_val, "bbox": bbox})
 
         return best_target, obstacle_dets
 
@@ -355,6 +341,25 @@ User: "Help me find my phone"
 
         return float(np.median(valid)) / 1000.0
 
+    def _estimate_distance_by_bbox_ratio(self, bbox, obj_class, cache):
+        """
+        삼각형 유사 원리로 depth dead zone 내 거리 추정.
+
+        원리: 카메라 bbox 픽셀 높이는 거리에 반비례하므로
+              d_now = d_last × (h_last / h_now)
+        물체의 실제 크기를 가정하지 않고, 마지막으로 depth가 유효했던
+        시점의 (d_last, h_last) 캐시만 사용.
+        """
+        entry = cache.get(obj_class)
+        if entry is None:
+            return None  # 캐시 없음 → 추정 불가
+        d_last, h_last = entry
+        _, y1, _, y2 = bbox
+        h_now = y2 - y1
+        if h_now <= 0 or h_last <= 0:
+            return None
+        return round(d_last * (h_last / h_now), 3)
+
     # ── 장애물 판정 ────────────────────────────────────────────
 
     def is_blocking_obstacle(self, obs_geom, obs_bbox, obs_distance,
@@ -377,20 +382,35 @@ User: "Help me find my phone"
 
     # ── 행동 결정 ──────────────────────────────────────────────
 
-    def select_action(self, target_info, blocking_obstacles, avoidance_attempts, is_emergency=False):
-        if is_emergency:
-            return "emergency_stop"
+    def select_action(self, target_info, blocking_obstacles, avoidance_attempts):
+        if blocking_obstacles:
+            if avoidance_attempts >= self.max_avoidance_attempts:
+                return "wait_user"
 
+            closest = min(blocking_obstacles, key=lambda o: o["distance"])
+
+            # depth·추정 모두 실패 → 거리 불명, 보수적으로 즉시 회피
+            if closest.get("depth_measurement") == "estimated_failed":
+                return "avoid_obstacle"
+
+            # obstacle_avoid_early_m(0.5m) 이내면 회피, 그보다 멀면 track으로 접근
+            # → 1m·2m 밖 장애물에 즉시 반응해 경로가 흐트러지는 문제 방지
+            if closest["distance"] <= self.obstacle_avoid_early_m:
+                return "avoid_obstacle"
+
+            # 아직 멀다 → 일단 target 방향으로 접근, 다음 프레임에서 재평가
+            return "track"
+
+        # 장애물 없음 — 정렬 후 거리 접근
         if not target_info["aligned"]:
             return "track"
 
-        if blocking_obstacles and avoidance_attempts >= self.max_avoidance_attempts:
-            return "wait_user"
+        dist = target_info.get("distance")
+        if dist is None:
+            # depth dead zone 진입 + 정렬 완료 → 목표 거리 도달로 간주
+            return "stop_at_target"
 
-        if blocking_obstacles:
-            return "avoid_obstacle"
-
-        distance_error = target_info["distance"] - self.target_distance_m
+        distance_error = dist - self.target_distance_m
         if abs(distance_error) <= self.distance_tolerance_m:
             return "stop_at_target"
 
@@ -415,10 +435,6 @@ User: "Help me find my phone"
                 f"\n📸 [System2] {src_label} "
                 f"(명령: {command}, attempts={avoidance_attempts})"
             )
-
-            is_emergency, min_dist = self.check_emergency_brake(depth_map)
-            if is_emergency:
-                print(f"🚨 [Emergency] 전방 {min_dist:.2f}m에 장애물 → emergency_stop")
 
             t_vlm = time.time()
             sys_prompt = self.build_planning_prompt()
@@ -466,6 +482,18 @@ User: "Help me find my phone"
                       f"bbox={[round(v,1) for v in od['bbox']]} "
                       f"conf={od['conf']:.3f}")
 
+            # 회전 직후 카메라 흔들림으로 conf가 임계 직하로 떨어지는 경우를 보완.
+            # 첫 시도에서 타겟을 못 찾으면 낮은 conf로 한 번 더 시도.
+            if target_det is None:
+                target_det_retry, obstacle_dets_retry = self.detect_objects(
+                    pil_img, target_obj, obstacle_classes, conf=0.02
+                )
+                if target_det_retry is not None:
+                    print(f"   🔄 [YOLO 재시도 conf=0.02] 타겟 발견: "
+                          f"conf={target_det_retry['conf']:.3f}")
+                    target_det = target_det_retry
+                    # obstacle_dets는 conf=0.05 원래 결과 유지 (노이즈 방지)
+
             if target_det is None:
                 timings["total_ms"] = round((time.time() - t_total_start) * 1000, 2)
                 return {
@@ -479,9 +507,17 @@ User: "Help me find my phone"
             target_geom = self.compute_geometry(target_det["bbox"], img_w, img_h)
 
             target_distance = self._read_depth_at_bbox(depth_map, target_det["bbox"])
-            if target_distance is None:
-                # target은 보이지만 depth 측정 불가 (너무 가깝거나 표면 측정 실패)
-                # → 정렬 여부에 따라 track / stop_at_target 분기
+
+            if target_distance is not None:
+                # 유효한 depth → 캐시 갱신 (dead zone 진입 후 추정에 사용)
+                _, ty1, _, ty2 = target_det["bbox"]
+                self._last_target_depth_cache[target_det["class"]] = (target_distance, ty2 - ty1)
+                print(f"📏 [Depth] target={target_distance:.2f}m")
+            else:
+                # depth dead zone 진입 — 삼각형 유사 원리로 거리 추정
+                est_dist = self._estimate_distance_by_bbox_ratio(
+                    target_det["bbox"], target_det["class"], self._last_target_depth_cache
+                )
                 aligned = target_geom["aligned"]
                 target_info = {
                     "class": target_det["class"],
@@ -490,8 +526,8 @@ User: "Help me find my phone"
                     "cx": target_geom["cx"],
                     "yaw_deg": target_geom["yaw_deg"],
                     "aligned": aligned,
-                    "distance": None,
-                    "distance_error": None,
+                    "distance": est_dist,  # 추정 거리 (캐시 없으면 None)
+                    "distance_error": (est_dist - self.target_distance_m) if est_dist is not None else None,
                 }
                 context = {
                     "target": target_info,
@@ -509,12 +545,19 @@ User: "Help me find my phone"
                     },
                     "avoidance_attempts": avoidance_attempts,
                 }
-                if aligned:
+                # 추정 거리로 도달 여부 판단. 정렬 + dead zone 진입도 stop으로 처리.
+                reached = (
+                    est_dist is not None
+                    and est_dist <= self.target_distance_m + self.distance_tolerance_m
+                )
+                if reached or aligned:
                     action = "stop_at_target"
-                    print(f"📏 [Depth] target=N/A (정렬됨 → stop_at_target, 너무 가까움)")
+                    dist_str = f"{est_dist:.2f}m" if est_dist is not None else "N/A"
+                    print(f"📏 [Depth] dead_zone est={dist_str} → stop_at_target")
                 else:
                     action = "track"
-                    print(f"📏 [Depth] target=N/A (정렬 우선)")
+                    dist_str = f"{est_dist:.2f}m" if est_dist is not None else "N/A"
+                    print(f"📏 [Depth] dead_zone est={dist_str} > {self.target_distance_m}m → track")
                 timings["post_ms"] = round((time.time() - t_post) * 1000, 2)
                 timings["total_ms"] = round((time.time() - t_total_start) * 1000, 2)
                 return {
@@ -525,7 +568,6 @@ User: "Help me find my phone"
                     "timings": timings,
                     "debug_frame": annotated_frame,
                 }
-            print(f"📏 [Depth] target={target_distance:.2f}m")
 
             obstacles_info = []
             blocking_obstacles = []
@@ -534,9 +576,22 @@ User: "Help me find my phone"
                 og = self.compute_geometry(od["bbox"], img_w, img_h)
 
                 obs_distance = self._read_depth_at_bbox(depth_map, od["bbox"])
-                depth_failed = obs_distance is None
-                if depth_failed:
-                    obs_distance = max(0.01, target_distance - 0.01)
+                if obs_distance is not None:
+                    # 유효한 depth → 캐시 갱신
+                    _, oy1, _, oy2 = od["bbox"]
+                    self._last_obs_depth_cache[od["class"]] = (obs_distance, oy2 - oy1)
+                    depth_status = "measured"
+                else:
+                    # depth 실패 → 삼각형 원리로 추정
+                    est = self._estimate_distance_by_bbox_ratio(
+                        od["bbox"], od["class"], self._last_obs_depth_cache
+                    )
+                    if est is not None:
+                        obs_distance = est
+                        depth_status = "estimated"      # 추정 성공 → 거리 기반 판단 가능
+                    else:
+                        obs_distance = max(0.01, target_distance - 0.05)
+                        depth_status = "estimated_failed"  # 추정도 불가 → 보수적 즉시 회피
 
                 blocking, reason = self.is_blocking_obstacle(
                     og, od["bbox"], obs_distance,
@@ -561,7 +616,7 @@ User: "Help me find my phone"
                     "yaw_deg": og["yaw_deg"],
                     "area_ratio": round(og["area_ratio"], 4),
                     "distance": round(obs_distance, 3),
-                    "depth_measurement": "estimated_failed" if depth_failed else "measured",
+                    "depth_measurement": depth_status,
                     "blocking": blocking,
                     "skip_reason": None if blocking else reason,
                 }
@@ -581,7 +636,7 @@ User: "Help me find my phone"
             }
 
             action = self.select_action(
-                target_info, blocking_obstacles, avoidance_attempts, is_emergency
+                target_info, blocking_obstacles, avoidance_attempts
             )
 
             annotated_frame = self.build_annotated_frame(
