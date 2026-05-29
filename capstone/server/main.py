@@ -198,9 +198,9 @@ def handle_one_request(conn, planner, executor, cmd_state):
     execution = executor.execute(action_command)
     t_exec_done = time.time()
 
-    # 이번 사이클 직진 거리 → 다음 사이클 odometry depth 추정에 사용
+    # 이번 사이클 직진 거리 → 측정 이후 누적 이동에 반영 (odometry depth 추정용)
     forward_dist = execution.get("forward_distance_this_cycle", 0.0)
-    planner.last_move_distance = forward_dist
+    planner.accumulate_move(forward_dist)
 
     t_server_sent = time.time()
     s2_timings = action_command.get("timings", {})

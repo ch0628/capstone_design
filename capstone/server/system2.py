@@ -76,9 +76,10 @@ class VisionPlanner:
         self.emergency_brake_distance_m = 0.3
 
         # odometry 기반 depth fallback 캐시
-        self.last_obs_distance = {}        # {class_name: distance_m}
-        self.last_target_distance = None
-        self.last_move_distance = 0.0       # 직전 사이클 직진 거리
+        self.last_obs_distance = {}             # {class: dist_at_last_measure}
+        self.last_target_distance = None        # dist_at_last_measure
+        self.move_since_obs_measure = {}        # {class: accumulated_move}
+        self.move_since_target_measure = 0.0    # target 측정 이후 누적 이동
 
         print("✅ System2(VisionPlanner) 준비 완료")
 
@@ -86,8 +87,16 @@ class VisionPlanner:
         """명령 변경 시 odometry 캐시 클리어."""
         self.last_obs_distance = {}
         self.last_target_distance = None
-        self.last_move_distance = 0.0
+        self.move_since_obs_measure = {}
+        self.move_since_target_measure = 0.0
         print("🧹 [System2] 상태 리셋 (명령 변경)")
+
+    def accumulate_move(self, forward_distance):
+        """매 사이클 끝에 main에서 호출. 직진 거리를 모든 캐시에 누적."""
+        if forward_distance > 0:
+            self.move_since_target_measure += forward_distance
+            for cls in self.move_since_obs_measure:
+                self.move_since_obs_measure[cls] += forward_distance
 
     # ── VLM ────────────────────────────────────────────────────
 
@@ -492,17 +501,16 @@ User: "Help me find my phone"
 
             target_distance = self._read_depth_at_bbox(depth_map, target_det["bbox"])
             if target_distance is not None:
-                # 측정 성공 → 캐시 갱신
+                # 측정 성공 → 캐시 갱신, 누적 0 리셋
                 self.last_target_distance = target_distance
+                self.move_since_target_measure = 0.0
                 depth_source = "measured"
             elif self.last_target_distance is not None:
-                # 측정 실패 + 캐시 있음 → odometry 추정
-                prev = self.last_target_distance
-                target_distance = max(0.0, prev - self.last_move_distance)
-                self.last_target_distance = target_distance
+                # 측정 실패 + 캐시 있음 → 마지막 측정값 - 누적 이동
+                target_distance = max(0.0, self.last_target_distance - self.move_since_target_measure)
                 depth_source = "estimated_odometry"
                 print(f"📏 [Depth] target odometry 추정: {target_distance:.2f}m "
-                      f"(prev {prev:.2f}m - move {self.last_move_distance:.2f}m)")
+                      f"(last_measure {self.last_target_distance:.2f}m - moved {self.move_since_target_measure:.2f}m)")
             else:
                 # 측정 실패 + 캐시 없음 → 기존 N/A 처리 (v5 그대로)
                 # target은 보이지만 depth 측정 불가 (너무 가깝거나 표면 측정 실패)
@@ -558,20 +566,22 @@ User: "Help me find my phone"
             for od in obstacle_dets:
                 og = self.compute_geometry(od["bbox"], img_w, img_h)
 
+                cls = od["class"]
                 obs_distance = self._read_depth_at_bbox(depth_map, od["bbox"])
 
                 if obs_distance is not None:
-                    # 측정 성공
-                    self.last_obs_distance[od["class"]] = obs_distance
+                    # 측정 성공 → 캐시 갱신, 누적 0 리셋
+                    self.last_obs_distance[cls] = obs_distance
+                    self.move_since_obs_measure[cls] = 0.0
                     depth_measurement = "measured"
-                elif od["class"] in self.last_obs_distance:
-                    # 측정 실패 + 캐시 있음 → odometry 추정
-                    prev_dist = self.last_obs_distance[od["class"]]
-                    obs_distance = max(0.0, prev_dist - self.last_move_distance)
-                    self.last_obs_distance[od["class"]] = obs_distance
+                elif cls in self.last_obs_distance:
+                    # 측정 실패 + 캐시 있음 → 마지막 측정값 - 누적 이동
+                    prev = self.last_obs_distance[cls]
+                    moved = self.move_since_obs_measure.get(cls, 0.0)
+                    obs_distance = max(0.0, prev - moved)
                     depth_measurement = "estimated_odometry"
-                    print(f"   📏 [obstacle odometry] {od['class']}: {obs_distance:.2f}m "
-                          f"(prev {prev_dist:.2f}m - move {self.last_move_distance:.2f}m)")
+                    print(f"   📏 [obstacle odometry] {cls}: {obs_distance:.2f}m "
+                          f"(last_measure {prev:.2f}m - moved {moved:.2f}m)")
                 else:
                     # 측정 실패 + 캐시 없음 → 기존 fallback
                     obs_distance = max(0.01, target_distance - 0.01)
