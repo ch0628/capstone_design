@@ -152,11 +152,22 @@ class MotionExecutor:
                 f"(obstacle={obstacle_distance:.2f}m measured ≤ 0.3m → 회피)"
             )
 
-        # 회피 방향
-        if most_blocking["yaw_deg"] > target["yaw_deg"]:
-            avoid_dir = "left"
+        # 회피 방향 결정
+        if most_blocking["yaw_deg"] != target["yaw_deg"]:
+            # yaw에 의미 있는 차이 있음
+            avoid_dir = "left" if most_blocking["yaw_deg"] > target["yaw_deg"] else "right"
         else:
-            avoid_dir = "right"
+            # yaw 동률 (둘 다 정면 또는 둘 다 tolerance 안) → bbox 화면 위치로 비교
+            ox1, _, ox2, _ = most_blocking["bbox"]
+            tx1, _, tx2, _ = target["bbox"]
+            obs_cx = (ox1 + ox2) / 2
+            target_cx = (tx1 + tx2) / 2
+            if obs_cx > target_cx:
+                avoid_dir = "left"   # obstacle이 더 오른쪽 → 왼쪽으로
+            elif obs_cx < target_cx:
+                avoid_dir = "right"  # obstacle이 더 왼쪽 → 오른쪽으로
+            else:
+                avoid_dir = "right"  # 진짜 같은 위치 → right 디폴트
 
         # bbox 기반 회피 각도 (상한 제거, 하한만 유지)
         x1, _, x2, _ = most_blocking["bbox"]
