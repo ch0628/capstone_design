@@ -100,33 +100,34 @@ def send_response(conn, response_dict):
 
 
 def _print_plan_diagnostics(action_command):
-    """장애물 인식 디버깅용 진단 출력 (system2에 이미 들어가있지만 main에서 한 번 더 요약)."""
+    """장애물 인식 디버깅용 진단 출력 요약."""
     status = action_command.get("status")
     action = action_command.get("action")
 
     plan_data = action_command.get("plan", {})
     if plan_data:
-        vlm_target = plan_data.get("target_object")
-        vlm_obstacles = plan_data.get("obstacle_classes", [])
-        print(f"🧠 [VLM 요약] target={vlm_target}, obstacle_classes={vlm_obstacles}")
+        vlm_target = plan_data.get("target")
+        vlm_obstacles = plan_data.get("obstacles", [])
+        target_cls = vlm_target.get("class") if vlm_target else None
+        print(f"🧠 [VLM 요약] target={target_cls}, obstacles={[o['class'] for o in vlm_obstacles]}")
 
     if status == "success":
         context = action_command.get("context", {})
         target = context.get("target", {})
         blocking = context.get("blocking_obstacles", [])
 
-        target_dist = target.get("distance", 0)
+        target_dist = target.get("distance")
         target_yaw = target.get("yaw_deg", 0)
         target_aligned = target.get("aligned", False)
+        dist_str = f"{target_dist:.2f}m" if target_dist is not None else "N/A"
         print(f"🎯 [Target] {target.get('class')} "
-              f"dist={target_dist:.2f}m yaw={target_yaw:+.1f}° aligned={target_aligned}")
+              f"dist={dist_str} yaw={target_yaw:+.1f}° aligned={target_aligned}")
 
         print(f"🚧 [Blocking] {len(blocking)}건 (action={action})")
         for b in blocking:
             print(f"   - {b.get('class')} "
                   f"dist={b.get('distance', 0):.2f}m "
-                  f"yaw={b.get('yaw_deg', 0):+.1f}° "
-                  f"conf={b.get('conf', 0):.2f}")
+                  f"yaw={b.get('yaw_deg', 0):+.1f}°")
 
     if status in ("abort", "retry"):
         print(f"⚠️  [{status}] 사유: {action_command.get('reason', 'unknown')}")
@@ -200,7 +201,6 @@ def handle_one_request(conn, system, cmd_state):
         "timings": {
             "pi_to_server_ms": round(pi_to_server_ms, 2),
             "vlm_inference_ms": r_timings.get("vlm_ms", 0.0),
-            "yolo_inference_ms": r_timings.get("yolo_ms", 0.0),
             "post_processing_ms": r_timings.get("post_ms", 0.0),
             "plan_total_ms": r_timings.get("plan_ms", 0.0),
             "action_gen_ms": r_timings.get("exec_ms", 0.0),

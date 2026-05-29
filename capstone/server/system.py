@@ -1,24 +1,14 @@
 """
-system.py — SeraphSystem (통합)
+system.py — SeraphSystem
 
-VisionPlanner (system2)와 MotionExecutor (system1)를 단일 클래스로 통합.
-run(image, command, depth_map, avoidance_attempts)로 계획·실행을 한 번에 처리한다.
+VLM + Depth만 사용. YOLO 없이 VLM이 의미 이해와 위치 탐지를 한 번에 처리한다.
 
-행동 종류:
-  - "track"           : target 추적 (정렬+전진)
-  - "avoid_obstacle"  : 회피 동작
-  - "stop_at_target"  : 목표 거리 도달, 정지
-  - "wait_user"       : 사용자 개입 대기
-  - "emergency_stop"  : 긴급 제동
-  - "retry"           : 일시적 실패, 다음 프레임 재시도
-  - "abort"           : 시스템 에러
-
-run() 반환값:
-    {
+run(image, command, depth_map, avoidance_attempts)
+    -> {
         "status", "action", "context", "plan",
-        "timings",    # vlm_ms, yolo_ms, post_ms, plan_ms, exec_ms, total_ms
+        "timings",    # vlm_ms, post_ms, plan_ms, exec_ms, total_ms
         "execution",  # executed_motions, next_action_hint, next_avoidance_attempts
-        "debug_frame",# YOLO BBox 그려진 BGR numpy (main.py에서 send_to_pc로 전송)
+        "debug_frame",# BBox 그려진 BGR numpy (main.py에서 send_to_pc로 전송)
     }
 """
 
@@ -30,7 +20,6 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForImageTextToText
-from ultralytics import YOLO
 from dotenv import load_dotenv
 import os
 import time
@@ -53,7 +42,7 @@ class SeraphSystem:
         if not hf_token:
             raise ValueError("HF_TOKEN이 .env 파일에 없습니다.")
 
-        print("🚀 [1/2] VLM(Qwen3.5-4B) 로딩 중...")
+        print("🚀 VLM(Qwen3.5-4B) 로딩 중...")
         vlm_id = "Qwen/Qwen3.5-4B"
         self.processor = AutoProcessor.from_pretrained(vlm_id, token=hf_token)
         self.vlm = AutoModelForImageTextToText.from_pretrained(
@@ -63,9 +52,6 @@ class SeraphSystem:
             device_map="auto",
             attn_implementation="sdpa",
         )
-
-        print("🚀 [2/2] YOLOv11 엔진 로딩 중...")
-        self.yolo = YOLO("yolo11n.pt")
 
         # ── 시각·계획 파라미터 ──────────────────────────────────
         self.hfov_deg = 70.0
@@ -90,7 +76,7 @@ class SeraphSystem:
 
     # ── VLM ────────────────────────────────────────────────────
 
-    def ask_vlm(self, image, system_prompt, user_text, max_new_tokens=128):
+    def ask_vlm(self, image, system_prompt, user_text, max_new_tokens=256):
         messages = [
             {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
             {
@@ -139,115 +125,141 @@ class SeraphSystem:
 
     def build_planning_prompt(self):
         pool_str = ", ".join(OBJECT_POOL)
-        return f"""You are a planning module for a home service robot.
-Given a user command and the camera image, decide:
-1) Which object the user wants the robot to approach (target_object).
-2) Which other objects in the scene could block the robot's path on the way to the target (obstacle_classes).
+        return f"""You are a perception and planning module for a home service robot.
+Given a user command and the camera image, identify:
+1) The object the user wants the robot to approach (target).
+2) Any objects that could block the robot's path to the target (obstacles).
+For each detected object, provide its bounding box in normalized coordinates [x1, y1, x2, y2] (values 0.0–1.0, origin at top-left).
 
-ALLOWED CLASSES (use these only, both for target and obstacles):
+ALLOWED CLASSES (use these only):
 [{pool_str}]
 
 KEY IDEA:
-The same class can be a target in one command and an obstacle in another, depending on user intent.
+The same class can be a target in one command and an obstacle in another.
 The user's intent decides the role.
 
 STRICT RULES:
-- target_object MUST be clearly visible in the image. If no suitable object is visible, set target_object to null.
-- obstacle_classes lists class names that appear in the image AND are physically positioned between the robot and the target.
-  - Do NOT include the target's own class in obstacle_classes.
-  - If target_object is null, also return [] for obstacle_classes.
+- target MUST be clearly visible in the image. If not visible, set target to null.
+- obstacles lists objects physically between the robot and the target.
+  - Do NOT include the target's class in obstacles.
+  - If target is null, return [] for obstacles.
+- bbox must be [x1, y1, x2, y2] in normalized coordinates (0.0–1.0).
 - Pick classes ONLY from the allowed list above.
 - Respond with ONE JSON object only. No explanation, no markdown.
 
 Output format:
-{{"intent": "<short verb phrase>", "target_object": "<class or null>", "obstacle_classes": ["<class>", ...]}}
+{{"intent": "<verb phrase>", "target": {{"class": "<class>", "bbox": [x1, y1, x2, y2]}}, "obstacles": [{{"class": "<class>", "bbox": [x1, y1, x2, y2]}}, ...]}}
+If target not visible: {{"intent": "<verb phrase>", "target": null, "obstacles": []}}
 
 Examples:
 User: "I'm thirsty"
--> {{"intent": "drink", "target_object": "bottle", "obstacle_classes": ["handbag"]}}
+-> {{"intent": "drink", "target": {{"class": "bottle", "bbox": [0.35, 0.10, 0.55, 0.85]}}, "obstacles": [{{"class": "handbag", "bbox": [0.60, 0.20, 0.80, 0.75]}}]}}
 
 User: "What time is it?"
--> {{"intent": "check_time", "target_object": "clock", "obstacle_classes": []}}
+-> {{"intent": "check_time", "target": {{"class": "clock", "bbox": [0.40, 0.15, 0.70, 0.60]}}, "obstacles": []}}
 
 User: "Let's play"
--> {{"intent": "play", "target_object": "sports ball", "obstacle_classes": ["cup"]}}
-
-User: "Bring me my bag"
--> {{"intent": "fetch_bag", "target_object": "handbag", "obstacle_classes": []}}
+-> {{"intent": "play", "target": {{"class": "sports ball", "bbox": [0.45, 0.50, 0.65, 0.90]}}, "obstacles": [{{"class": "cup", "bbox": [0.20, 0.30, 0.35, 0.70]}}]}}
 
 User: "Help me find my phone"
-(no phone visible in scene, and phone is not in allowed classes)
--> {{"intent": "locate_phone", "target_object": null, "obstacle_classes": []}}
+-> {{"intent": "locate_phone", "target": null, "obstacles": []}}
 """
 
-    def parse_vlm_plan(self, raw_text):
-        json_matches = re.findall(r"\{.*?\}", raw_text, re.DOTALL)
-        if not json_matches:
+    def _extract_json(self, raw_text):
+        """중첩 JSON을 올바르게 추출한다."""
+        start = raw_text.find('{')
+        if start == -1:
             return None
 
-        try:
-            data = json.loads(json_matches[-1])
-        except json.JSONDecodeError:
+        depth = 0
+        in_string = False
+        escape = False
+
+        for i, ch in enumerate(raw_text[start:], start):
+            if escape:
+                escape = False
+                continue
+            if ch == '\\' and in_string:
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(raw_text[start:i + 1])
+                    except json.JSONDecodeError:
+                        return None
+        return None
+
+    def _validate_bbox(self, bbox):
+        if not (isinstance(bbox, list) and len(bbox) == 4):
+            return False
+        if not all(isinstance(v, (int, float)) for v in bbox):
+            return False
+        x1, y1, x2, y2 = bbox
+        return 0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0
+
+    def parse_vlm_plan(self, raw_text):
+        data = self._extract_json(raw_text)
+        if data is None:
             print("⚠️ JSON 파싱 실패")
             return None
 
-        target = data.get("target_object")
-        if isinstance(target, str) and target.lower() in ("null", "none", ""):
-            target = None
-        if isinstance(target, str):
-            target = target.lower()
-            if target not in [c.lower() for c in OBJECT_POOL]:
-                print(f"⚠️ target '{target}'이 OBJECT_POOL에 없음 → null 처리")
-                target = None
-
-        obstacles = data.get("obstacle_classes", [])
-        if not isinstance(obstacles, list):
-            obstacles = []
         pool_lower = [c.lower() for c in OBJECT_POOL]
-        obstacles = list({
-            o.lower() for o in obstacles
-            if isinstance(o, str) and o.lower() in pool_lower
-        })
-        if target and target in obstacles:
-            obstacles.remove(target)
+
+        # target 파싱
+        target_data = data.get("target")
+        target = None
+        if isinstance(target_data, dict):
+            cls = target_data.get("class")
+            bbox = target_data.get("bbox")
+            if isinstance(cls, str) and cls.lower() not in ("null", "none", ""):
+                cls = cls.lower()
+                if cls in pool_lower and self._validate_bbox(bbox):
+                    target = {"class": cls, "bbox": bbox}
+                else:
+                    if cls not in pool_lower:
+                        print(f"⚠️ target '{cls}'이 OBJECT_POOL에 없음 → null 처리")
+                    elif not self._validate_bbox(bbox):
+                        print(f"⚠️ target bbox 유효하지 않음: {bbox} → null 처리")
+
+        # obstacles 파싱
+        obstacles = []
+        for obs in data.get("obstacles", []):
+            if not isinstance(obs, dict):
+                continue
+            cls = obs.get("class")
+            bbox = obs.get("bbox")
+            if not (isinstance(cls, str) and cls.lower() not in ("null", "none", "")):
+                continue
+            cls = cls.lower()
+            if cls not in pool_lower:
+                continue
+            if target and cls == target["class"]:
+                continue
+            if self._validate_bbox(bbox):
+                obstacles.append({"class": cls, "bbox": bbox})
+
         if not target:
             obstacles = []
 
         return {
             "intent": data.get("intent"),
-            "target_object": target,
-            "obstacle_classes": obstacles,
+            "target": target,
+            "obstacles": obstacles,
         }
 
-    # ── YOLO ───────────────────────────────────────────────────
-
-    def detect_objects(self, pil_img, target_class, obstacle_classes):
-        yolo_results = self.yolo.predict(pil_img, conf=0.05, verbose=False)
-
-        target_class_lower = target_class.lower() if target_class else None
-        obstacle_classes_lower = [c.lower() for c in obstacle_classes]
-
-        best_target = None
-        best_target_conf = -1.0
-        obstacle_dets = []
-
-        for r in yolo_results:
-            for box in r.boxes:
-                label = r.names[int(box.cls[0])].lower()
-                conf = float(box.conf[0])
-                bbox = box.xyxy[0].tolist()
-
-                if target_class_lower and label == target_class_lower:
-                    if conf > best_target_conf:
-                        best_target_conf = conf
-                        best_target = {"class": label, "conf": conf, "bbox": bbox}
-                elif label in obstacle_classes_lower:
-                    obstacle_dets.append({"class": label, "conf": conf, "bbox": bbox})
-
-        return best_target, obstacle_dets
+    # ── 시각화 ─────────────────────────────────────────────────
 
     def build_annotated_frame(self, pil_img, target_det, obstacle_dets, plan=None, action=None):
-        """YOLO BBox가 그려진 BGR 프레임 (Local PC debug_frame_sender용)."""
+        """BBox가 그려진 BGR 프레임 (Local PC debug_frame_sender용)."""
         frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
         for od in obstacle_dets:
@@ -255,7 +267,7 @@ User: "Help me find my phone"
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
             cv2.putText(
                 frame,
-                f"{od['class']} {od['conf']:.2f}",
+                od["class"],
                 (x1, max(y1 - 6, 12)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
@@ -268,7 +280,7 @@ User: "Help me find my phone"
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(
                 frame,
-                f"TARGET {target_det['class']} {target_det['conf']:.2f}",
+                f"TARGET {target_det['class']}",
                 (x1, max(y1 - 6, 12)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -277,7 +289,8 @@ User: "Help me find my phone"
             )
 
         if plan:
-            label = plan.get("target_object") or "no_target"
+            target_info = plan.get("target")
+            label = target_info["class"] if target_info else "no_target"
             intent = plan.get("intent") or ""
             cv2.putText(
                 frame,
@@ -612,6 +625,7 @@ User: "Help me find my phone"
             if is_emergency:
                 print(f"🚨 [Emergency] 전방 {min_dist:.2f}m에 장애물 → emergency_stop")
 
+            # ── VLM: 의미 이해 + 위치 탐지 ──────────────────────
             t_vlm = time.time()
             sys_prompt = self.build_planning_prompt()
             res_vlm = self.ask_vlm(pil_img, sys_prompt, command)
@@ -626,181 +640,182 @@ User: "Help me find my phone"
                     "timings": timings,
                 }
             else:
-                target_obj = plan["target_object"]
-                obstacle_classes = plan["obstacle_classes"]
-                print(f"🧠 [Plan] target={target_obj}, obstacles={obstacle_classes}")
+                target_plan = plan["target"]
+                print(f"🧠 [Plan] target={target_plan}, obstacles={plan['obstacles']}")
 
-                if not target_obj:
+                if not target_plan:
                     action_command = {
                         "status": "retry", "action": "retry",
                         "reason": "no_target",
                         "plan": plan, "timings": timings,
                     }
                 else:
-                    t_yolo = time.time()
-                    target_det, obstacle_dets = self.detect_objects(
-                        pil_img, target_obj, obstacle_classes
-                    )
-                    timings["yolo_ms"] = round((time.time() - t_yolo) * 1000, 2)
+                    # ── normalized bbox → pixel bbox ──────────────
+                    target_det = {
+                        "class": target_plan["class"],
+                        "bbox": [
+                            target_plan["bbox"][0] * img_w,
+                            target_plan["bbox"][1] * img_h,
+                            target_plan["bbox"][2] * img_w,
+                            target_plan["bbox"][3] * img_h,
+                        ],
+                    }
+                    obstacle_dets = []
+                    for obs in plan["obstacles"]:
+                        obstacle_dets.append({
+                            "class": obs["class"],
+                            "bbox": [
+                                obs["bbox"][0] * img_w,
+                                obs["bbox"][1] * img_h,
+                                obs["bbox"][2] * img_w,
+                                obs["bbox"][3] * img_h,
+                            ],
+                        })
+
+                    print(f"   🔍 [VLM detect] target=O, obstacles={len(obstacle_dets)}건")
+                    print(f"   🎯 [VLM target] {target_det['class']} "
+                          f"bbox={[round(v,1) for v in target_det['bbox']]}")
+                    for od in obstacle_dets:
+                        print(f"   🚧 [VLM obstacle] {od['class']} "
+                              f"bbox={[round(v,1) for v in od['bbox']]}")
 
                     annotated_frame = self.build_annotated_frame(
                         pil_img, target_det, obstacle_dets, plan=plan
                     )
 
-                    print(f"   🔍 [YOLO] target_det={'O' if target_det else 'X'}, obstacle_dets={len(obstacle_dets)}건")
-                    if target_det:
-                        print(f"   🎯 [YOLO target] bbox={[round(v,1) for v in target_det['bbox']]} "
-                              f"conf={target_det['conf']:.3f}")
-                    for od in obstacle_dets:
-                        print(f"   🚧 [YOLO obstacle] {od['class']} "
-                              f"bbox={[round(v,1) for v in od['bbox']]} "
-                              f"conf={od['conf']:.3f}")
+                    t_post = time.time()
+                    target_geom = self.compute_geometry(target_det["bbox"], img_w, img_h)
+                    target_distance = self._read_depth_at_bbox(depth_map, target_det["bbox"])
 
-                    if target_det is None:
+                    if target_distance is None:
+                        aligned = target_geom["aligned"]
+                        target_info = {
+                            "class": target_det["class"],
+                            "bbox": target_det["bbox"],
+                            "cx": target_geom["cx"],
+                            "yaw_deg": target_geom["yaw_deg"],
+                            "aligned": aligned,
+                            "distance": None,
+                            "distance_error": None,
+                        }
+                        context = {
+                            "target": target_info,
+                            "obstacles": [],
+                            "blocking_obstacles": [],
+                            "image": {
+                                "width": img_w,
+                                "height": img_h,
+                                "hfov_deg": self.hfov_deg,
+                            },
+                            "config": {
+                                "target_distance_m": self.target_distance_m,
+                                "distance_tolerance_m": self.distance_tolerance_m,
+                                "center_tolerance_px": self.center_tolerance_px,
+                            },
+                            "avoidance_attempts": avoidance_attempts,
+                        }
+                        if aligned:
+                            action = "stop_at_target"
+                            print(f"📏 [Depth] target=N/A (정렬됨 → stop_at_target, 너무 가까움)")
+                        else:
+                            action = "track"
+                            print(f"📏 [Depth] target=N/A (정렬 우선)")
+                        timings["post_ms"] = round((time.time() - t_post) * 1000, 2)
                         action_command = {
-                            "status": "retry", "action": "retry",
-                            "reason": "target_not_found",
-                            "plan": plan, "timings": timings,
+                            "status": "success",
+                            "action": action,
+                            "context": context,
+                            "plan": plan,
+                            "timings": timings,
                             "debug_frame": annotated_frame,
                         }
                     else:
-                        t_post = time.time()
-                        target_geom = self.compute_geometry(target_det["bbox"], img_w, img_h)
-                        target_distance = self._read_depth_at_bbox(depth_map, target_det["bbox"])
+                        print(f"📏 [Depth] target={target_distance:.2f}m")
 
-                        if target_distance is None:
-                            aligned = target_geom["aligned"]
-                            target_info = {
-                                "class": target_det["class"],
-                                "conf": round(target_det["conf"], 3),
-                                "bbox": target_det["bbox"],
-                                "cx": target_geom["cx"],
-                                "yaw_deg": target_geom["yaw_deg"],
-                                "aligned": aligned,
-                                "distance": None,
-                                "distance_error": None,
-                            }
-                            context = {
-                                "target": target_info,
-                                "obstacles": [],
-                                "blocking_obstacles": [],
-                                "image": {
-                                    "width": img_w,
-                                    "height": img_h,
-                                    "hfov_deg": self.hfov_deg,
-                                },
-                                "config": {
-                                    "target_distance_m": self.target_distance_m,
-                                    "distance_tolerance_m": self.distance_tolerance_m,
-                                    "center_tolerance_px": self.center_tolerance_px,
-                                },
-                                "avoidance_attempts": avoidance_attempts,
-                            }
-                            if aligned:
-                                action = "stop_at_target"
-                                print(f"📏 [Depth] target=N/A (정렬됨 → stop_at_target, 너무 가까움)")
-                            else:
-                                action = "track"
-                                print(f"📏 [Depth] target=N/A (정렬 우선)")
-                            timings["post_ms"] = round((time.time() - t_post) * 1000, 2)
-                            action_command = {
-                                "status": "success",
-                                "action": action,
-                                "context": context,
-                                "plan": plan,
-                                "timings": timings,
-                                "debug_frame": annotated_frame,
-                            }
-                        else:
-                            print(f"📏 [Depth] target={target_distance:.2f}m")
+                        obstacles_info = []
+                        blocking_obstacles = []
 
-                            obstacles_info = []
-                            blocking_obstacles = []
+                        for od in obstacle_dets:
+                            og = self.compute_geometry(od["bbox"], img_w, img_h)
 
-                            for od in obstacle_dets:
-                                og = self.compute_geometry(od["bbox"], img_w, img_h)
+                            obs_distance = self._read_depth_at_bbox(depth_map, od["bbox"])
+                            depth_failed = obs_distance is None
+                            if depth_failed:
+                                obs_distance = max(0.01, target_distance - 0.01)
 
-                                obs_distance = self._read_depth_at_bbox(depth_map, od["bbox"])
-                                depth_failed = obs_distance is None
-                                if depth_failed:
-                                    obs_distance = max(0.01, target_distance - 0.01)
-
-                                blocking, reason = self.is_blocking_obstacle(
-                                    og, od["bbox"], obs_distance,
-                                    target_geom, target_det["bbox"], target_distance,
-                                )
-
-                                ox1, _, ox2, _ = od["bbox"]
-                                tx1, _, tx2, _ = target_det["bbox"]
-                                tw = tx2 - tx1
-                                x_overlap = (ox2 >= (tx1 - tw)) and (ox1 <= (tx2 + tw))
-
-                                print(f"   🔍 [obstacle filter] {od['class']} "
-                                      f"conf={od['conf']:.2f} "
-                                      f"dist={obs_distance:.2f}m yaw={og['yaw_deg']:+.1f}° "
-                                      f"x_overlap={'O' if x_overlap else 'X'} "
-                                      f"→ {'BLOCKING' if blocking else f'skip({reason})'}")
-
-                                entry = {
-                                    "class": od["class"],
-                                    "conf": round(od["conf"], 3),
-                                    "bbox": od["bbox"],
-                                    "yaw_deg": og["yaw_deg"],
-                                    "area_ratio": round(og["area_ratio"], 4),
-                                    "distance": round(obs_distance, 3),
-                                    "depth_measurement": "estimated_failed" if depth_failed else "measured",
-                                    "blocking": blocking,
-                                    "skip_reason": None if blocking else reason,
-                                }
-                                obstacles_info.append(entry)
-                                if blocking:
-                                    blocking_obstacles.append(entry)
-
-                            target_info = {
-                                "class": target_det["class"],
-                                "conf": round(target_det["conf"], 3),
-                                "bbox": target_det["bbox"],
-                                "cx": target_geom["cx"],
-                                "yaw_deg": target_geom["yaw_deg"],
-                                "aligned": target_geom["aligned"],
-                                "distance": target_distance,
-                                "distance_error": target_distance - self.target_distance_m,
-                            }
-
-                            action = self.select_action(
-                                target_info, blocking_obstacles, avoidance_attempts, is_emergency
+                            blocking, reason = self.is_blocking_obstacle(
+                                og, od["bbox"], obs_distance,
+                                target_geom, target_det["bbox"], target_distance,
                             )
 
-                            annotated_frame = self.build_annotated_frame(
-                                pil_img, target_det, obstacle_dets, plan=plan, action=action
-                            )
+                            ox1, _, ox2, _ = od["bbox"]
+                            tx1, _, tx2, _ = target_det["bbox"]
+                            tw = tx2 - tx1
+                            x_overlap = (ox2 >= (tx1 - tw)) and (ox1 <= (tx2 + tw))
 
-                            context = {
-                                "target": target_info,
-                                "obstacles": obstacles_info,
-                                "blocking_obstacles": blocking_obstacles,
-                                "image": {
-                                    "width": img_w,
-                                    "height": img_h,
-                                    "hfov_deg": self.hfov_deg,
-                                },
-                                "config": {
-                                    "target_distance_m": self.target_distance_m,
-                                    "distance_tolerance_m": self.distance_tolerance_m,
-                                    "center_tolerance_px": self.center_tolerance_px,
-                                },
-                                "avoidance_attempts": avoidance_attempts,
-                            }
+                            print(f"   🔍 [obstacle filter] {od['class']} "
+                                  f"dist={obs_distance:.2f}m yaw={og['yaw_deg']:+.1f}° "
+                                  f"x_overlap={'O' if x_overlap else 'X'} "
+                                  f"→ {'BLOCKING' if blocking else f'skip({reason})'}")
 
-                            timings["post_ms"] = round((time.time() - t_post) * 1000, 2)
-                            action_command = {
-                                "status": "success",
-                                "action": action,
-                                "context": context,
-                                "plan": plan,
-                                "timings": timings,
-                                "debug_frame": annotated_frame,
+                            entry = {
+                                "class": od["class"],
+                                "bbox": od["bbox"],
+                                "yaw_deg": og["yaw_deg"],
+                                "area_ratio": round(og["area_ratio"], 4),
+                                "distance": round(obs_distance, 3),
+                                "depth_measurement": "estimated_failed" if depth_failed else "measured",
+                                "blocking": blocking,
+                                "skip_reason": None if blocking else reason,
                             }
+                            obstacles_info.append(entry)
+                            if blocking:
+                                blocking_obstacles.append(entry)
+
+                        target_info = {
+                            "class": target_det["class"],
+                            "bbox": target_det["bbox"],
+                            "cx": target_geom["cx"],
+                            "yaw_deg": target_geom["yaw_deg"],
+                            "aligned": target_geom["aligned"],
+                            "distance": target_distance,
+                            "distance_error": target_distance - self.target_distance_m,
+                        }
+
+                        action = self.select_action(
+                            target_info, blocking_obstacles, avoidance_attempts, is_emergency
+                        )
+
+                        annotated_frame = self.build_annotated_frame(
+                            pil_img, target_det, obstacle_dets, plan=plan, action=action
+                        )
+
+                        context = {
+                            "target": target_info,
+                            "obstacles": obstacles_info,
+                            "blocking_obstacles": blocking_obstacles,
+                            "image": {
+                                "width": img_w,
+                                "height": img_h,
+                                "hfov_deg": self.hfov_deg,
+                            },
+                            "config": {
+                                "target_distance_m": self.target_distance_m,
+                                "distance_tolerance_m": self.distance_tolerance_m,
+                                "center_tolerance_px": self.center_tolerance_px,
+                            },
+                            "avoidance_attempts": avoidance_attempts,
+                        }
+
+                        timings["post_ms"] = round((time.time() - t_post) * 1000, 2)
+                        action_command = {
+                            "status": "success",
+                            "action": action,
+                            "context": context,
+                            "plan": plan,
+                            "timings": timings,
+                            "debug_frame": annotated_frame,
+                        }
 
         except Exception as e:
             print(f"❌ 에러: {e}")
