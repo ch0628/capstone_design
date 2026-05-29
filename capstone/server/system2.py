@@ -75,7 +75,19 @@ class VisionPlanner:
         self.target_distance_m = 0.3
         self.emergency_brake_distance_m = 0.3
 
+        # odometry 기반 depth fallback 캐시
+        self.last_obs_distance = {}        # {class_name: distance_m}
+        self.last_target_distance = None
+        self.last_move_distance = 0.0       # 직전 사이클 직진 거리
+
         print("✅ System2(VisionPlanner) 준비 완료")
+
+    def reset_state(self):
+        """명령 변경 시 odometry 캐시 클리어."""
+        self.last_obs_distance = {}
+        self.last_target_distance = None
+        self.last_move_distance = 0.0
+        print("🧹 [System2] 상태 리셋 (명령 변경)")
 
     # ── VLM ────────────────────────────────────────────────────
 
@@ -479,7 +491,20 @@ User: "Help me find my phone"
             target_geom = self.compute_geometry(target_det["bbox"], img_w, img_h)
 
             target_distance = self._read_depth_at_bbox(depth_map, target_det["bbox"])
-            if target_distance is None:
+            if target_distance is not None:
+                # 측정 성공 → 캐시 갱신
+                self.last_target_distance = target_distance
+                depth_source = "measured"
+            elif self.last_target_distance is not None:
+                # 측정 실패 + 캐시 있음 → odometry 추정
+                prev = self.last_target_distance
+                target_distance = max(0.0, prev - self.last_move_distance)
+                self.last_target_distance = target_distance
+                depth_source = "estimated_odometry"
+                print(f"📏 [Depth] target odometry 추정: {target_distance:.2f}m "
+                      f"(prev {prev:.2f}m - move {self.last_move_distance:.2f}m)")
+            else:
+                # 측정 실패 + 캐시 없음 → 기존 N/A 처리 (v5 그대로)
                 # target은 보이지만 depth 측정 불가 (너무 가깝거나 표면 측정 실패)
                 # → 정렬 여부에 따라 track / stop_at_target 분기
                 aligned = target_geom["aligned"]
@@ -525,7 +550,7 @@ User: "Help me find my phone"
                     "timings": timings,
                     "debug_frame": annotated_frame,
                 }
-            print(f"📏 [Depth] target={target_distance:.2f}m")
+            print(f"📏 [Depth] target={target_distance:.2f}m (source={depth_source})")
 
             obstacles_info = []
             blocking_obstacles = []
@@ -534,9 +559,23 @@ User: "Help me find my phone"
                 og = self.compute_geometry(od["bbox"], img_w, img_h)
 
                 obs_distance = self._read_depth_at_bbox(depth_map, od["bbox"])
-                depth_failed = obs_distance is None
-                if depth_failed:
+
+                if obs_distance is not None:
+                    # 측정 성공
+                    self.last_obs_distance[od["class"]] = obs_distance
+                    depth_measurement = "measured"
+                elif od["class"] in self.last_obs_distance:
+                    # 측정 실패 + 캐시 있음 → odometry 추정
+                    prev_dist = self.last_obs_distance[od["class"]]
+                    obs_distance = max(0.0, prev_dist - self.last_move_distance)
+                    self.last_obs_distance[od["class"]] = obs_distance
+                    depth_measurement = "estimated_odometry"
+                    print(f"   📏 [obstacle odometry] {od['class']}: {obs_distance:.2f}m "
+                          f"(prev {prev_dist:.2f}m - move {self.last_move_distance:.2f}m)")
+                else:
+                    # 측정 실패 + 캐시 없음 → 기존 fallback
                     obs_distance = max(0.01, target_distance - 0.01)
+                    depth_measurement = "estimated_failed"
 
                 blocking, reason = self.is_blocking_obstacle(
                     og, od["bbox"], obs_distance,
@@ -561,7 +600,7 @@ User: "Help me find my phone"
                     "yaw_deg": og["yaw_deg"],
                     "area_ratio": round(og["area_ratio"], 4),
                     "distance": round(obs_distance, 3),
-                    "depth_measurement": "estimated_failed" if depth_failed else "measured",
+                    "depth_measurement": depth_measurement,
                     "blocking": blocking,
                     "skip_reason": None if blocking else reason,
                 }

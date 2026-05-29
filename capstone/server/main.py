@@ -35,7 +35,10 @@ class CommandState:
     def __init__(self):
         self.current = None
 
-    def update(self, new_cmd):
+    def update(self, new_cmd, planner=None):
+        if new_cmd is not None and new_cmd != self.current:
+            if planner is not None:
+                planner.reset_state()
         if new_cmd is not None:
             self.current = new_cmd
 
@@ -140,7 +143,7 @@ def handle_one_request(conn, planner, executor, cmd_state):
         return False
 
     if cmd_str is not None:
-        cmd_state.update(cmd_str)
+        cmd_state.update(cmd_str, planner=planner)
         print(f"📝 [명령 갱신] '{cmd_str}'")
 
     if not cmd_state.is_set():
@@ -194,6 +197,10 @@ def handle_one_request(conn, planner, executor, cmd_state):
     t_exec_start = time.time()
     execution = executor.execute(action_command)
     t_exec_done = time.time()
+
+    # 이번 사이클 직진 거리 → 다음 사이클 odometry depth 추정에 사용
+    forward_dist = execution.get("forward_distance_this_cycle", 0.0)
+    planner.last_move_distance = forward_dist
 
     t_server_sent = time.time()
     s2_timings = action_command.get("timings", {})
