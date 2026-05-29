@@ -16,8 +16,7 @@ import sys
 import numpy as np
 from PIL import Image
 
-from system2 import VisionPlanner
-from system1 import MotionExecutor
+from system import SeraphSystem
 from debug_frame_sender import get_debug_sender, send_to_pc
 
 
@@ -133,7 +132,7 @@ def _print_plan_diagnostics(action_command):
         print(f"⚠️  [{status}] 사유: {action_command.get('reason', 'unknown')}")
 
 
-def handle_one_request(conn, planner, executor, cmd_state):
+def handle_one_request(conn, system, cmd_state):
     cmd_str, rgb_bytes, depth_bytes, t_pi_start = receive_one_frame(conn)
     if rgb_bytes is None:
         print("⚠️ 연결 끊김 또는 데이터 없음")
@@ -175,51 +174,46 @@ def handle_one_request(conn, planner, executor, cmd_state):
           f"min={depth_map.min()}, max={depth_map.max()}, "
           f"valid_pct={(depth_map > 0).sum() / depth_map.size * 100:.1f}%")
 
-    t_plan_start = time.time()
-    action_command = planner.plan(
+    result = system.run(
         image=pil_img,
         command=command,
         depth_map=depth_map,
         avoidance_attempts=0,
     )
-    t_plan_done = time.time()
 
-    _print_plan_diagnostics(action_command)
+    _print_plan_diagnostics(result)
 
     # YOLO annotated frame → Local PC (non-blocking, 전송 실패해도 파이프라인 계속)
-    debug_frame = action_command.pop("debug_frame", None)
+    debug_frame = result.pop("debug_frame", None)
     if debug_frame is not None:
         send_to_pc(debug_frame)
 
-    t_exec_start = time.time()
-    execution = executor.execute(action_command)
-    t_exec_done = time.time()
+    execution = result.pop("execution", {})
 
+    r_timings = result.get("timings", {})
     t_server_sent = time.time()
-    s2_timings = action_command.get("timings", {})
     response = {
-        "status": action_command.get("status", "unknown"),
+        "status": result.get("status", "unknown"),
         "command": command,
-        "action_command": _strip_internal(action_command),
+        "action_command": _strip_internal(result),
         "execution": execution,
         "timings": {
             "pi_to_server_ms": round(pi_to_server_ms, 2),
-            "vlm_inference_ms": s2_timings.get("vlm_ms", 0.0),
-            "yolo_inference_ms": s2_timings.get("yolo_ms", 0.0),
-            "post_processing_ms": s2_timings.get("post_ms", 0.0),
-            "plan_total_ms": s2_timings.get("total_ms",
-                round((t_plan_done - t_plan_start) * 1000, 2)),
-            "action_gen_ms": round((t_exec_done - t_exec_start) * 1000, 2),
+            "vlm_inference_ms": r_timings.get("vlm_ms", 0.0),
+            "yolo_inference_ms": r_timings.get("yolo_ms", 0.0),
+            "post_processing_ms": r_timings.get("post_ms", 0.0),
+            "plan_total_ms": r_timings.get("plan_ms", 0.0),
+            "action_gen_ms": r_timings.get("exec_ms", 0.0),
             "server_sent_ts": t_server_sent,
         },
     }
 
     send_response(conn, response)
     print(f"📤 응답 전송 완료 "
-          f"(VLM: {s2_timings.get('vlm_ms', 0):.1f}ms, "
-          f"YOLO: {s2_timings.get('yolo_ms', 0):.1f}ms, "
-          f"post: {s2_timings.get('post_ms', 0):.1f}ms, "
-          f"execute: {(t_exec_done-t_exec_start)*1000:.1f}ms)")
+          f"(VLM: {r_timings.get('vlm_ms', 0):.1f}ms, "
+          f"YOLO: {r_timings.get('yolo_ms', 0):.1f}ms, "
+          f"post: {r_timings.get('post_ms', 0):.1f}ms, "
+          f"execute: {r_timings.get('exec_ms', 0):.1f}ms)")
 
     return True
 
@@ -284,8 +278,7 @@ def main():
     server_sock = create_listen_socket(LISTEN_HOST, LISTEN_PORT, label="RPi")
     print(f"✅ RPi 포트 확보: {LISTEN_HOST}:{LISTEN_PORT}")
 
-    planner = VisionPlanner()
-    executor = MotionExecutor()
+    system = SeraphSystem()
     cmd_state = CommandState()
 
     if get_debug_sender() is None:
@@ -297,7 +290,7 @@ def main():
             conn, addr = server_sock.accept()
             print(f"\n🔌 RPi 연결됨: {addr}")
             try:
-                handle_one_request(conn, planner, executor, cmd_state)
+                handle_one_request(conn, system, cmd_state)
             except Exception as e:
                 print(f"❌ 요청 처리 중 에러: {e}")
                 import traceback
