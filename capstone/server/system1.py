@@ -153,11 +153,13 @@ class MotionExecutor:
         raw_turn = half_angle_deg + self.avoid_safety_margin_deg
         clamped_turn = max(self.avoid_turn_min_deg, raw_turn)
 
-        # 장애물 거리 기반 전진 (한 사이클당 max 캡 적용)
-        avoid_forward = min(
-            obstacle_distance + self.avoid_pass_buffer_m,
-            self.max_forward_per_cycle_m,
-        )
+        # 대각선 보정 전진: 회전각만큼 정면 진행이 줄어드므로 더 길게 이동
+        turn_rad = math.radians(clamped_turn)
+        if turn_rad >= math.pi / 2:
+            diagonal_distance = obstacle_distance + self.avoid_pass_buffer_m
+        else:
+            diagonal_distance = (obstacle_distance + self.avoid_pass_buffer_m) / math.cos(turn_rad)
+        avoid_forward = diagonal_distance
 
         # 복귀 회전: 회피 회전과 같은 각도, 반대 방향
         return_dir = "right" if avoid_dir == "left" else "left"
@@ -166,7 +168,7 @@ class MotionExecutor:
             f"   ↪ 회피 대상: {most_blocking['class']} "
             f"(obstacle={obstacle_distance:.2f}m, "
             f"turn raw={raw_turn:.2f}°, clamped={clamped_turn:.2f}°, "
-            f"forward={avoid_forward:.2f}m, return turn {clamped_turn:.2f}°)"
+            f"diagonal_forward={avoid_forward:.2f}m, return turn {clamped_turn:.2f}°)"
         )
 
         executed.append(self._motor_turn(avoid_dir, clamped_turn))
