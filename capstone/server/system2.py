@@ -42,6 +42,7 @@ OBJECT_POOL = [
     "sports ball",
     "car",
     "handbag",
+    "book",
 ]
 
 
