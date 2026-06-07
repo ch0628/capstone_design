@@ -32,7 +32,7 @@ import math
 class MotionExecutor:
     def __init__(self):
         # 회피 동작 파라미터
-        self.avoid_safety_margin_deg = 15.0
+        self.avoid_safety_margin_deg = 20.0
         self.avoid_turn_min_deg = 10.0
         self.avoid_turn_max_deg = 30.0
         self.avoid_pass_buffer_m = 0.1   # 장애물 너머 여유 마진
