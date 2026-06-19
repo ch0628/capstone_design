@@ -32,7 +32,7 @@ import math
 class MotionExecutor:
     def __init__(self):
         # 회피 동작 파라미터
-        self.avoid_safety_margin_deg = 15.0
+        self.avoid_safety_margin_deg = 20.0
         self.avoid_turn_min_deg = 10.0
         self.avoid_turn_max_deg = 30.0
         self.avoid_pass_buffer_m = 0.1   # 장애물 너머 여유 마진
@@ -84,7 +84,7 @@ class MotionExecutor:
             direction = "left" if yaw < 0 else "right"
             turn_amount = min(abs(yaw), self.max_turn_per_cycle_deg)
             executed.append(self._motor_turn(direction, turn_amount))
-            return executed, "continue"
+            return executed, "continue", 0.0
 
         distance_error = target["distance_error"]
         tolerance = config["distance_tolerance_m"]
@@ -92,21 +92,22 @@ class MotionExecutor:
         if distance_error > tolerance:
             move_dist = min(distance_error, self.max_forward_per_cycle_m)
             executed.append(self._motor_move("front", move_dist))
-            return executed, "continue"
+            return executed, "continue", move_dist
         elif distance_error < -tolerance:
             move_dist = min(abs(distance_error), self.max_forward_per_cycle_m)
             executed.append(self._motor_move("back", move_dist))
-            return executed, "continue"
+            return executed, "continue", 0.0
         else:
             executed.append(self._motor_stop())
-            return executed, "done"
+            return executed, "done", 0.0
 
     def _execute_avoid_obstacle(self, context):
         """
-        가장 가까운 blocking 장애물 기준으로 분기:
-          (a) depth 측정 실패 → 0.3m로 가정하고 (c)로 회피
-          (b) 0.3m 이상 → 직진해서 거리 좁힘 (회피 안 함)
-          (c) 0.3m 미만 → 회전 + 전진 회피
+        가장 가까운 blocking 장애물의 측정 상태(depth_measurement) 기준으로 분기:
+          measured + 0.3m 초과       → (b) 직진해서 거리 좁힘
+          measured + 0.3m 이하       → (c) 회피
+          estimated_odometry         → (c) 즉시 회피 (측정 실패 = 임계 도달)
+          estimated_failed           → (c) 즉시 회피 (캐시 없음, 0.3m 가정)
         """
         target = context["target"]
         blocking = context["blocking_obstacles"]
@@ -116,33 +117,58 @@ class MotionExecutor:
 
         # 가장 위험한 장애물 = 거리가 가장 가까운 것
         most_blocking = min(blocking, key=lambda o: o["distance"])
+        obstacle_distance = most_blocking["distance"]
+        depth_status = most_blocking.get("depth_measurement", "measured")
 
-        # ── 분기 (a): depth 실패 → 0.3m 가정 후 (c)로 fallthrough ──
-        if most_blocking.get("depth_measurement") == "estimated_failed":
-            obstacle_distance = 0.3
+        # ── 분기 (b): 측정 성공 + 여유 있음 → 직진 ──────────────
+        if depth_status == "measured" and obstacle_distance > 0.3:
+            move_dist = min(obstacle_distance - 0.3, self.max_forward_per_cycle_m)
             print(
                 f"   ↪ 회피 대상: {most_blocking['class']} "
-                f"(depth 측정 실패 → 0.3m로 가정하고 회피)"
+                f"(obstacle={obstacle_distance:.2f}m measured > 0.3m → 직진 {move_dist:.2f}m로 거리 좁힘)"
+            )
+            executed.append(self._motor_move("front", move_dist))
+            return executed, "reevaluate", move_dist
+
+        # ── 분기 (c): 회피 진입 ─────────────────────────────────
+        if depth_status == "estimated_failed":
+            # 캐시 없음 → 0.3m 가정 (v5 fallback 유지)
+            obstacle_distance_for_avoid = 0.3
+            print(
+                f"   ↪ 회피 대상: {most_blocking['class']} "
+                f"(depth 측정 실패, 캐시 없음 → 0.3m 가정하고 회피)"
+            )
+        elif depth_status == "estimated_odometry":
+            # 측정 실패하지만 odometry 추정값 있음 → 그 값 사용
+            obstacle_distance_for_avoid = obstacle_distance
+            print(
+                f"   ↪ 회피 대상: {most_blocking['class']} "
+                f"(obstacle={obstacle_distance:.2f}m odometry → 즉시 회피)"
             )
         else:
-            obstacle_distance = most_blocking["distance"]
+            # measured + 0.3m 이하 → 그 측정값으로 회피
+            obstacle_distance_for_avoid = obstacle_distance
+            print(
+                f"   ↪ 회피 대상: {most_blocking['class']} "
+                f"(obstacle={obstacle_distance:.2f}m measured ≤ 0.3m → 회피)"
+            )
 
-            # ── 분기 (b): 아직 멀어서 거리만 좁힘 ──────────────
-            if obstacle_distance >= 0.3:
-                move_dist = min(obstacle_distance - 0.3, self.max_forward_per_cycle_m)
-                print(
-                    f"   ↪ 회피 대상: {most_blocking['class']} "
-                    f"(obstacle={obstacle_distance:.2f}m ≥ 0.3m → 직진 {move_dist:.2f}m로 거리 좁힘)"
-                )
-                executed.append(self._motor_move("front", move_dist))
-                return executed, "reevaluate"
-
-        # ── 분기 (c): 0.3m 미만 → 회전 + 전진 회피 ─────────────
-        # 회피 방향
-        if most_blocking["yaw_deg"] > target["yaw_deg"]:
-            avoid_dir = "left"
+        # 회피 방향 결정
+        if most_blocking["yaw_deg"] != target["yaw_deg"]:
+            # yaw에 의미 있는 차이 있음
+            avoid_dir = "left" if most_blocking["yaw_deg"] > target["yaw_deg"] else "right"
         else:
-            avoid_dir = "right"
+            # yaw 동률 (둘 다 정면 또는 둘 다 tolerance 안) → bbox 화면 위치로 비교
+            ox1, _, ox2, _ = most_blocking["bbox"]
+            tx1, _, tx2, _ = target["bbox"]
+            obs_cx = (ox1 + ox2) / 2
+            target_cx = (tx1 + tx2) / 2
+            if obs_cx > target_cx:
+                avoid_dir = "left"   # obstacle이 더 오른쪽 → 왼쪽으로
+            elif obs_cx < target_cx:
+                avoid_dir = "right"  # obstacle이 더 왼쪽 → 오른쪽으로
+            else:
+                avoid_dir = "right"  # 진짜 같은 위치 → right 디폴트
 
         # bbox 기반 회피 각도 (상한 제거, 하한만 유지)
         x1, _, x2, _ = most_blocking["bbox"]
@@ -154,27 +180,28 @@ class MotionExecutor:
         raw_turn = half_angle_deg + self.avoid_safety_margin_deg
         clamped_turn = max(self.avoid_turn_min_deg, raw_turn)
 
-        # 장애물 거리 기반 전진 (한 사이클당 max 캡 적용)
-        avoid_forward = min(
-            obstacle_distance + self.avoid_pass_buffer_m,
-            self.max_forward_per_cycle_m,
-        )
+        # 대각선 보정 전진: 회전각만큼 정면 진행이 줄어드므로 더 길게 이동
+        turn_rad = math.radians(clamped_turn)
+        if turn_rad >= math.pi / 2:
+            diagonal_distance = obstacle_distance_for_avoid + self.avoid_pass_buffer_m
+        else:
+            diagonal_distance = (obstacle_distance_for_avoid + self.avoid_pass_buffer_m) / math.cos(turn_rad)
+        avoid_forward = diagonal_distance
 
         # 복귀 회전: 회피 회전과 같은 각도, 반대 방향
         return_dir = "right" if avoid_dir == "left" else "left"
 
         print(
-            f"   ↪ 회피 대상: {most_blocking['class']} "
-            f"(obstacle={obstacle_distance:.2f}m, "
-            f"turn raw={raw_turn:.2f}°, clamped={clamped_turn:.2f}°, "
-            f"forward={avoid_forward:.2f}m, return turn {clamped_turn:.2f}°)"
+            f"   ↪ turn={clamped_turn:.2f}°({avoid_dir}), "
+            f"diagonal_forward={avoid_forward:.2f}m, "
+            f"return turn {clamped_turn:.2f}°"
         )
 
         executed.append(self._motor_turn(avoid_dir, clamped_turn))
         executed.append(self._motor_move("front", avoid_forward))
         executed.append(self._motor_turn(return_dir, clamped_turn))
 
-        return executed, "reevaluate"
+        return executed, "reevaluate", avoid_forward
 
     def _execute_stop_at_target(self, context):
         executed = [self._motor_stop()]
@@ -232,16 +259,17 @@ class MotionExecutor:
         current_attempts = context.get("avoidance_attempts", 0)
 
         # 행동별 분기
+        forward_distance = 0.0
         if action == "emergency_stop":
             executed = [self._motor_stop()]
             print("🚨 [긴급 제동] 로봇 바로 앞에 장애물이 감지되어 정지합니다.")
             hint = "reevaluate"
             next_attempts = current_attempts
         elif action == "track":
-            executed, hint = self._execute_track(context)
+            executed, hint, forward_distance = self._execute_track(context)
             next_attempts = 0
         elif action == "avoid_obstacle":
-            executed, hint = self._execute_avoid_obstacle(context)
+            executed, hint, forward_distance = self._execute_avoid_obstacle(context)
             next_attempts = current_attempts + 1
         elif action == "stop_at_target":
             executed, hint = self._execute_stop_at_target(context)
@@ -260,4 +288,5 @@ class MotionExecutor:
             "executed_motions": executed,
             "next_action_hint": hint,
             "next_avoidance_attempts": next_attempts,
+            "forward_distance_this_cycle": forward_distance,
         }

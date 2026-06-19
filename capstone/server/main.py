@@ -35,7 +35,10 @@ class CommandState:
     def __init__(self):
         self.current = None
 
-    def update(self, new_cmd):
+    def update(self, new_cmd, planner=None):
+        if new_cmd is not None and new_cmd != self.current:
+            if planner is not None:
+                planner.reset_state()
         if new_cmd is not None:
             self.current = new_cmd
 
@@ -140,9 +143,8 @@ def handle_one_request(conn, planner, executor, cmd_state):
         return False
 
     if cmd_str is not None:
-        cmd_state.update(cmd_str)
-        planner.reset_state() # 새 작업 시작 시 상태 초기화
-        print(f"📝 [명령 갱신] '{cmd_str}' (상태 초기화)")
+        cmd_state.update(cmd_str, planner=planner)
+        print(f"📝 [명령 갱신] '{cmd_str}'")
 
     if not cmd_state.is_set():
         print("❌ 명령이 아직 세팅 안 됨. RPi가 먼저 명령을 보내야 함.")
@@ -195,6 +197,10 @@ def handle_one_request(conn, planner, executor, cmd_state):
     t_exec_start = time.time()
     execution = executor.execute(action_command)
     t_exec_done = time.time()
+
+    # 이번 사이클 직진 거리 → 측정 이후 누적 이동에 반영 (odometry depth 추정용)
+    forward_dist = execution.get("forward_distance_this_cycle", 0.0)
+    planner.accumulate_move(forward_dist)
 
     t_server_sent = time.time()
     s2_timings = action_command.get("timings", {})
