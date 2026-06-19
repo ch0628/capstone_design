@@ -41,7 +41,8 @@ LINEAR_SPEED_MPS = 0.400   # ★ 0.285 → 0.400
 ANGULAR_SPEED_DPS = 135.0  # ★ 45.0 → 135.0
 
 # 모터 동작 후 settle delay (관성 잦아들기 위해 대기)
-SETTLE_DELAY_S = 0.15
+TURN_SETTLE_DELAY_S = 0.6   # 회전 후 카메라 안정화에 더 오래 필요
+MOVE_SETTLE_DELAY_S = 0.4
 
 # 너무 짧은 동작은 모터가 못 따라가니 최소 시간 보장
 MIN_ACTION_TIME_S = 0.05
@@ -137,7 +138,7 @@ class MotorDriver:
 
         time.sleep(duration_s)
         self._stop_all()
-        time.sleep(SETTLE_DELAY_S)
+        time.sleep(MOVE_SETTLE_DELAY_S)
 
     def turn(self, direction, angle_deg):
         """
@@ -170,7 +171,7 @@ class MotorDriver:
 
         time.sleep(duration_s)
         self._stop_all()
-        time.sleep(SETTLE_DELAY_S)
+        time.sleep(TURN_SETTLE_DELAY_S)
 
     def stop(self):
         self._display_msg("STOP")
