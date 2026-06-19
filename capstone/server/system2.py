@@ -10,7 +10,6 @@ System 2 — VisionPlanner (merged: 잘된 날 베이스 + retry/진단/blocking
   - "avoid_obstacle"  : 회피 동작 필요
   - "stop_at_target"  : 목표 거리 도달, 정지
   - "wait_user"       : 사용자 개입 대기 (회피 한도 초과 등)
-  - "emergency_stop"  : 긴급 제동 (충돌 위험)
   - "retry"           : 일시적 실패, 다음 프레임에서 재시도
   - "abort"           : 시스템 에러 (예외 발생)
 

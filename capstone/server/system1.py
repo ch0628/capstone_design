@@ -76,6 +76,7 @@ class MotionExecutor:
         """
         target = context["target"]
         config = context["config"]
+        is_blind = target.get("is_blind", False)
         executed = []
 
         if not target["aligned"]:
