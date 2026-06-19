@@ -141,7 +141,8 @@ def handle_one_request(conn, planner, executor, cmd_state):
 
     if cmd_str is not None:
         cmd_state.update(cmd_str)
-        print(f"📝 [명령 갱신] '{cmd_str}'")
+        planner.reset_state() # 새 작업 시작 시 상태 초기화
+        print(f"📝 [명령 갱신] '{cmd_str}' (상태 초기화)")
 
     if not cmd_state.is_set():
         print("❌ 명령이 아직 세팅 안 됨. RPi가 먼저 명령을 보내야 함.")
